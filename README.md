@@ -205,6 +205,24 @@ $ chisel server --help
     validate client connections. The provided CA certificates will be used 
     instead of the system roots. This is commonly used to implement mutual-TLS. 
 
+    --record-dir, Enable channel recording: append one JSON record per
+    tunnel session and forwarded connection to rotating channels-*.jsonl
+    segments in this directory. Addresses in records are redacted with a
+    keyed hash (see --record-key). Recording is best-effort and never
+    interrupts forwarding. Off by default.
+
+    --record-key, Key material used to redact addresses in channel
+    records (defaults to the CHISEL_RECORD_KEY environment variable,
+    otherwise a random key generated into <record-dir>/record.key).
+    Holders of the key map a record token back to a candidate address
+    by recomputing its token.
+
+    --record-max-size, Rotate the channel record segment after this
+    many bytes. Defaults to 67108864 (64MiB).
+
+    --record-max-age, Rotate the channel record segment after this
+    much time. Defaults to 24h.
+
     --pid Generate pid file in current working directory
 
     -v, Enable verbose logging
@@ -375,6 +393,24 @@ $ chisel client --help
     private key. The certificate must have client authentication 
     enabled (mutual-TLS).
 
+    --record-dir, Enable channel recording: append one JSON record per
+    tunnel session and forwarded connection to rotating channels-*.jsonl
+    segments in this directory. Addresses in records are redacted with a
+    keyed hash (see --record-key). Recording is best-effort and never
+    interrupts forwarding. Off by default.
+
+    --record-key, Key material used to redact addresses in channel
+    records (defaults to the CHISEL_RECORD_KEY environment variable,
+    otherwise a random key generated into <record-dir>/record.key).
+    Holders of the key map a record token back to a candidate address
+    by recomputing its token.
+
+    --record-max-size, Rotate the channel record segment after this
+    many bytes. Defaults to 67108864 (64MiB).
+
+    --record-max-age, Rotate the channel record segment after this
+    much time. Defaults to 24h.
+
     --pid Generate pid file in current working directory
 
     -v, Enable verbose logging
@@ -396,6 +432,121 @@ $ chisel client --help
 
 ```
 <!--/tmpl-->
+
+### Channel records
+
+Both `chisel server` and `chisel client` can write a structured audit
+trail of every tunnel session and forwarded connection, enabled with
+`--record-dir <dir>` (off by default; when off, no record files are
+created and logging is unchanged). Each side records its own view:
+run the flag on both ends to correlate a channel across the tunnel.
+
+Records are newline-delimited JSON (JSONL) in rotating
+`channels-<timestamp>-<seq>.jsonl` segments inside the directory.
+Rotation happens at `--record-max-size` bytes (default 64MiB) or
+`--record-max-age` (default 24h), whichever comes first. Every record
+is fsynced as it is written, so a SIGKILLed process never leaves a
+partial or unflushed record behind.
+
+A sample channel lifecycle (one line per record, pretty-printed here):
+
+``` json
+{"v":1,"id":"r9f2c1a4b6d84e01-3","type":"open","kind":"session",
+ "ts":"2026-11-22T04:00:01.010Z","run_id":"r9f2c1a4b6d84e01","end":"server",
+ "user":"alice","peer":"h1:JIen4CDwPfxiYnX7","remotes":["h1:G6Hc9pE_znl2W87M"],
+ "session_id":"r9f2c1a4b6d84e01-s1","logical_id":"h1:WQXgYFx-S587uKez"}
+
+{"v":1,"id":"r9f2c1a4b6d84e01-4","type":"open","kind":"channel",
+ "ts":"2026-11-22T04:00:03.512Z","run_id":"r9f2c1a4b6d84e01","end":"server",
+ "side":"outbound","remote":"h1:NLwDNhFEkj0GGdKk","src":"h1:JIen4CDwPfxiYnX7",
+ "dst":"h1:NLwDNhFEkj0GGdKk","session_id":"r9f2c1a4b6d84e01-s1",
+ "channel_id":"r9f2c1a4b6d84e01-s1-c2"}
+
+{"v":1,"id":"r9f2c1a4b6d84e01-5","type":"close","kind":"channel",
+ "ts":"2026-11-22T04:00:07.904Z","run_id":"r9f2c1a4b6d84e01","end":"server",
+ "session_id":"r9f2c1a4b6d84e01-s1","channel_id":"r9f2c1a4b6d84e01-s1-c2",
+ "opened_at":"2026-11-22T04:00:03.511Z","duration_ms":4392,
+ "bytes_sent":145,"bytes_received":120,"close_reason":"peer_closed"}
+
+{"v":1,"id":"r9f2c1a4b6d84e01-6","type":"close","kind":"session",
+ "ts":"2026-11-22T04:01:00.100Z","run_id":"r9f2c1a4b6d84e01","end":"server",
+ "session_id":"r9f2c1a4b6d84e01-s1","logical_id":"h1:WQXgYFx-S587uKez",
+ "opened_at":"2026-11-22T04:00:01.009Z","duration_ms":59091,
+ "close_reason":"timeout","error":"h1:8xQ2mZpLrT4vN1wK"}
+```
+
+Field write timing:
+
+- `v`, `id`, `type`, `kind`, `ts`, `run_id`, `end` — stamped on every
+  record at write time. `v` is the record format version (currently
+  `1`); readers must switch on it, and v1 semantics never change.
+  `id` is unique per record: deduplicate by it when reading.
+- `session_id`, `logical_id`, `user`, `peer`, `remotes` — written at
+  session open (server: after the client config is validated; client:
+  after the config is acknowledged). `logical_id` is stable across
+  reconnects of the same user and remote set, so a reconnecting
+  client appears as the same logical channel's next `session_id`,
+  not as an unrelated channel.
+- `channel_id`, `side`, `remote`, `src`, `dst` — written at channel
+  open (inbound: when the listener accepts a connection; outbound:
+  after the SSH channel is accepted). Join open and close records on
+  `channel_id`.
+- `opened_at`, `duration_ms`, `bytes_sent`, `bytes_received`,
+  `close_reason`, `error` — written only on close/reject records.
+  Byte counters are cumulative over the channel's lifetime.
+  `close_reason` is one of `peer_closed`, `timeout`, `auth_failed`,
+  `protocol_error`, `shutdown`, `error`. Channels refused before
+  establishment (ACL denial, dial failure) appear as `type:"reject"`
+  with the reason, instead of an open/close pair.
+
+Queries: filter `type:"open"`/`"close"` records by `ts` to list what
+was established or torn down in a time window; totals derived by
+counting detail records always reconcile with the detail rows.
+
+Redaction: `peer`, `remote`, `src`, `dst`, `remotes` and IP addresses
+inside `error` are keyed-hash tokens (`h1:` + HMAC-SHA256, keyed with
+`--record-key`, the `CHISEL_RECORD_KEY` environment variable, or a
+random key generated into `<record-dir>/record.key`, mode 0600).
+Plaintext internal addresses never appear in records. To map a token
+back during debugging, recompute it for a candidate address with the
+same key, e.g.:
+
+``` sh
+KEY=$(cat /var/log/chisel/record.key)
+printf 'db.internal:5432' | openssl dgst -sha256 -hmac "$KEY" -binary | head -c12 | base64 | tr '+/' '-_' | tr -d '='
+```
+
+Prefix the output with `h1:` and compare it with a record token; a
+match confirms the candidate address. Session `logical_id` tokens are
+computed over `session|<user>|<comma-separated sorted remotes>`. Use
+the same `--record-key` on every instance whose records you want to
+correlate.
+
+Failure behavior: recording never interrupts forwarding. An
+unwritable record directory logs a warning and records are buffered
+in memory (up to 4096) and rewritten when the directory becomes
+writable; a record that fails to serialize is skipped and counted.
+Rewrites reuse the original record `id`, so they never create
+duplicates.
+
+Relationship to existing logging: the human-readable logs
+(`conn#N: Open/Close`, `session#N: Open/Close`) and the in-memory
+connection counters are unchanged and serve live debugging; channel
+records are a separate, opt-in, machine-readable trail. Neither reads
+the other's state, and enabling records does not alter any existing
+log output.
+
+Known limitations:
+
+- Byte counters are recorded for TCP channels only; SOCKS5 and UDP
+  flows record open/close without counters.
+- Inbound UDP listeners (`/udp` remotes) are not recorded yet.
+- `error` strings redact IP addresses and ports, but hostnames inside
+  third-party error text cannot be recognized and are left as-is.
+- If the record directory is unwritable at startup, records buffered
+  before the first writable segment use an ephemeral redaction key,
+  so their tokens will not match `record.key` tokens from later
+  segments.
 
 ### Security
 

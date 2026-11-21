@@ -16,6 +16,7 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/crecord"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/requestlog"
 	"golang.org/x/crypto/ssh"
@@ -23,15 +24,16 @@ import (
 
 // Config is the configuration for the chisel service
 type Config struct {
-	KeySeed   string        `opts:"name=key,short=-" help:"(deprecated use --keygen and --keyfile instead) An optional string to seed the generation of a ECDSA public and private key pair. All communications will be secured using this key pair. Share the subsequent fingerprint with clients to enable detection of man-in-the-middle attacks (defaults to the CHISEL_KEY environment variable, otherwise a new key is generate each run)."`
-	KeyFile   string        `opts:"name=keyfile,short=-" help:"An optional path to a PEM-encoded SSH private key. When this flag is set, the --key option is ignored, and the provided private key is used to secure all communications. (defaults to the CHISEL_KEY_FILE environment variable). Since ECDSA keys are short, you may also set keyfile to the inline key string itself, exactly as printed by --keygen (a base64 string with a \"ck-\" prefix); no extra base64 encoding is needed."`
-	AuthFile  string        `opts:"name=authfile,short=-" help:"An optional path to a users.json file. This file should be an object with users defined like:\n  {\n    \"<user:pass>\": [\"<addr-regex>\",\"<addr-regex>\"]\n  }\nwhen <user> connects, their <pass> will be verified and then each of the remote addresses will be compared against the list of address regular expressions for a match. Patterns are NOT anchored by default: \"10.0.0.1:80\" also matches \"210.0.0.1:8080\", and \".\" matches any character. Anchor your patterns, e.g. \"^10\\.0\\.0\\.1:80$\". The empty string \"\" matches every address. Addresses will always come in the form \"<remote-host>:<remote-port>\" for normal remotes, \"R:<local-interface>:<local-port>\" for reverse port forwarding remotes, and \"socks\" for SOCKS5 proxy access. Note that SOCKS5 access previously bypassed this list; existing authfiles which should allow SOCKS5 must add an entry matching \"socks\" (the empty wildcard \"\" matches everything, including \"socks\"). This file will be automatically reloaded on change. Reloads apply to new connections and to new tunnels of connected clients; established tunnels are not interrupted."`
-	Auth      string        `opts:"name=auth,short=-" help:"An optional string representing a single user with full access, in the form of <user:pass>. It is equivalent to creating an authfile with {\"<user:pass>\": [\"\"]}. If unset, it will use the environment variable AUTH."`
-	Proxy     string        `opts:"name=backend,short=-" help:"Specifies another HTTP server to proxy requests to when chisel receives a normal HTTP request. Useful for hiding chisel in plain sight. --proxy is accepted as an alias for this flag."`
-	Socks5    bool          `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
-	Reverse   bool          `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
-	KeepAlive time.Duration `opts:"name=keepalive,short=-" help:"An optional keepalive interval. Since the underlying transport is HTTP, in many instances we'll be traversing through proxies, often these proxies will close idle connections. You must specify a time with a unit, for example '5s' or '2m'. Defaults to '25s' (set to 0s to disable)."`
-	TLS       TLSConfig     `opts:"mode=embedded"`
+	KeySeed   string             `opts:"name=key,short=-" help:"(deprecated use --keygen and --keyfile instead) An optional string to seed the generation of a ECDSA public and private key pair. All communications will be secured using this key pair. Share the subsequent fingerprint with clients to enable detection of man-in-the-middle attacks (defaults to the CHISEL_KEY environment variable, otherwise a new key is generate each run)."`
+	KeyFile   string             `opts:"name=keyfile,short=-" help:"An optional path to a PEM-encoded SSH private key. When this flag is set, the --key option is ignored, and the provided private key is used to secure all communications. (defaults to the CHISEL_KEY_FILE environment variable). Since ECDSA keys are short, you may also set keyfile to the inline key string itself, exactly as printed by --keygen (a base64 string with a \"ck-\" prefix); no extra base64 encoding is needed."`
+	AuthFile  string             `opts:"name=authfile,short=-" help:"An optional path to a users.json file. This file should be an object with users defined like:\n  {\n    \"<user:pass>\": [\"<addr-regex>\",\"<addr-regex>\"]\n  }\nwhen <user> connects, their <pass> will be verified and then each of the remote addresses will be compared against the list of address regular expressions for a match. Patterns are NOT anchored by default: \"10.0.0.1:80\" also matches \"210.0.0.1:8080\", and \".\" matches any character. Anchor your patterns, e.g. \"^10\\.0\\.0\\.1:80$\". The empty string \"\" matches every address. Addresses will always come in the form \"<remote-host>:<remote-port>\" for normal remotes, \"R:<local-interface>:<local-port>\" for reverse port forwarding remotes, and \"socks\" for SOCKS5 proxy access. Note that SOCKS5 access previously bypassed this list; existing authfiles which should allow SOCKS5 must add an entry matching \"socks\" (the empty wildcard \"\" matches everything, including \"socks\"). This file will be automatically reloaded on change. Reloads apply to new connections and to new tunnels of connected clients; established tunnels are not interrupted."`
+	Auth      string             `opts:"name=auth,short=-" help:"An optional string representing a single user with full access, in the form of <user:pass>. It is equivalent to creating an authfile with {\"<user:pass>\": [\"\"]}. If unset, it will use the environment variable AUTH."`
+	Proxy     string             `opts:"name=backend,short=-" help:"Specifies another HTTP server to proxy requests to when chisel receives a normal HTTP request. Useful for hiding chisel in plain sight. --proxy is accepted as an alias for this flag."`
+	Socks5    bool               `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
+	Reverse   bool               `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
+	KeepAlive time.Duration      `opts:"name=keepalive,short=-" help:"An optional keepalive interval. Since the underlying transport is HTTP, in many instances we'll be traversing through proxies, often these proxies will close idle connections. You must specify a time with a unit, for example '5s' or '2m'. Defaults to '25s' (set to 0s to disable)."`
+	TLS       TLSConfig          `opts:"mode=embedded"`
+	Record    crecord.FlagConfig `opts:"mode=embedded"`
 }
 
 // Server represent a chisel service
@@ -44,6 +46,7 @@ type Server struct {
 	sessCount    int32
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+	recorder     *crecord.Recorder
 }
 
 var upgrader = websocket.Upgrader{
@@ -140,6 +143,18 @@ func NewServer(c *Config) (*Server, error) {
 	if c.Reverse {
 		server.Infof("Reverse tunnelling enabled")
 	}
+	//channel recording is opt-in; when disabled no recorder (and no
+	//record files) exist at all
+	if c.Record.Enabled() {
+		cfg := c.Record.Config("server", settings.Env("RECORD_KEY"))
+		cfg.Logger = server.Logger
+		rec, err := crecord.New(cfg)
+		if err != nil {
+			return nil, err
+		}
+		server.recorder = rec
+		server.Infof("Channel recording enabled (dir %s)", c.Record.Dir)
+	}
 	return server, nil
 }
 
@@ -187,6 +202,9 @@ func (s *Server) Wait() error {
 
 // Close forcibly closes the http server
 func (s *Server) Close() error {
+	if s.recorder != nil {
+		s.recorder.Close()
+	}
 	return s.httpServer.Close()
 }
 

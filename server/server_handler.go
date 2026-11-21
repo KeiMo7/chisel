@@ -162,6 +162,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		Outbound:  true, //server always accepts outbound
 		Socks:     s.config.Socks5,
 		KeepAlive: s.config.KeepAlive,
+		Recorder:  s.recorder,
 	}
 	//enforce ACL on every channel, not just the initial config.
 	//the user is re-resolved from the live index per channel, so
@@ -173,7 +174,14 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 			return found && u.HasAccess(addr)
 		}
 	}
+	//describe this session's peer for channel records before binding
+	sessInfo := tunnel.SessionInfo{
+		User:    username,
+		Addr:    req.RemoteAddr,
+		Remotes: c.Remotes.Encode(),
+	}
 	tunnel := tunnel.New(tunnelConfig)
+	tunnel.SetSession(sessInfo)
 	//bind
 	eg, ctx := errgroup.WithContext(req.Context())
 	eg.Go(func() error {

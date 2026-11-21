@@ -14,6 +14,7 @@ import (
 	"github.com/jpillora/chisel/share/cnet"
 	"github.com/jpillora/chisel/share/cos"
 	"github.com/jpillora/chisel/share/settings"
+	"github.com/jpillora/chisel/share/tunnel"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -136,6 +137,15 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		return false, errors.New(string(configerr))
 	}
 	c.Infof("Connected (Latency %s)", time.Since(t0))
+	//describe this session's peer for channel records before binding;
+	//the client keeps one recorder across reconnects, so reconnects
+	//share the run ID and logical ID of earlier sessions
+	user, _ := settings.ParseAuth(c.config.Auth)
+	c.tunnel.SetSession(tunnel.SessionInfo{
+		User:    user,
+		Addr:    c.server,
+		Remotes: c.computed.Remotes.Encode(),
+	})
 	//connected, handover ssh connection for tunnel to use, and block
 	err = c.tunnel.BindSSH(ctx, sshConn, reqs, chans)
 	c.Infof("Disconnected")

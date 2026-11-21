@@ -94,12 +94,14 @@ func TestHelpListsEveryFlag(t *testing.T) {
 			"--host", "--port", "--keygen", "--key", "--keyfile", "--authfile",
 			"--auth", "--backend", "--socks5", "--reverse", "--keepalive",
 			"--tls-key", "--tls-cert", "--tls-domain", "--tls-ca", "--proxy",
+			"--record-dir", "--record-key", "--record-max-size", "--record-max-age",
 			"--pid", "--verbose",
 		},
 		"client": {
 			"--fingerprint", "--auth", "--keepalive", "--max-retry-count",
 			"--min-retry-interval", "--max-retry-interval", "--proxy",
 			"--tls-skip-verify", "--tls-ca", "--tls-cert", "--tls-key",
+			"--record-dir", "--record-key", "--record-max-size", "--record-max-age",
 			"--verbose", "--header", "--hostname", "--sni", "--pid",
 		},
 	}

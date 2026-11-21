@@ -2,9 +2,11 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/settings"
@@ -15,6 +17,15 @@ import (
 // sshTunnel exposes a subset of Tunnel to subtypes
 type sshTunnel interface {
 	getSSH(ctx context.Context) ssh.Conn
+}
+
+// recordingTunnel is optionally implemented by an sshTunnel to
+// receive channel records. *Tunnel implements it; test doubles and
+// UDP-only paths simply don't.
+type recordingTunnel interface {
+	nextChannelID() string
+	recordChannelOpen(id, side, remote, src, dst string, opened time.Time)
+	recordChannelClose(id string, opened time.Time, sent, recv int64, err error)
 }
 
 // Proxy is the inbound portion of a Tunnel
@@ -165,19 +176,40 @@ func (p *Proxy) pipeRemote(ctx context.Context, src io.ReadWriteCloser) {
 
 	l := p.Fork("conn#%d", cid)
 	l.Debugf("Open")
+	//record the inbound channel from accept to close
+	rt, recording := p.sshTun.(recordingTunnel)
+	chanID := ""
+	opened := time.Now()
+	if recording {
+		chanID = rt.nextChannelID()
+		srcAddr := ""
+		if c, ok := src.(net.Conn); ok && c.RemoteAddr() != nil {
+			srcAddr = c.RemoteAddr().String()
+		}
+		rt.recordChannelOpen(chanID, "inbound", p.remote.String(), srcAddr, p.remote.Remote(), opened)
+	}
 	sshConn := p.sshTun.getSSH(ctx)
 	if sshConn == nil {
 		l.Debugf("No remote connection")
+		if recording {
+			rt.recordChannelClose(chanID, opened, 0, 0, errors.New("no remote connection"))
+		}
 		return
 	}
 	//ssh request for tcp connection for this proxy's remote
 	dst, reqs, err := sshConn.OpenChannel("chisel", []byte(p.remote.Remote()))
 	if err != nil {
 		l.Infof("Stream error: %s", err)
+		if recording {
+			rt.recordChannelClose(chanID, opened, 0, 0, err)
+		}
 		return
 	}
 	go ssh.DiscardRequests(reqs)
 	//then pipe
 	s, r := cio.Pipe(src, dst)
 	l.Debugf("Close (sent %s received %s)", sizestr.ToString(s), sizestr.ToString(r))
+	if recording {
+		rt.recordChannelClose(chanID, opened, s, r, nil)
+	}
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/crecord"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/chisel/share/tunnel"
 
@@ -42,6 +43,7 @@ type Config struct {
 	Remotes          []string                                                          `opts:"name=remote,mode=arg,min=1"`
 	Headers          http.Header                                                       `opts:"-"`
 	TLS              TLSConfig                                                         `opts:"mode=embedded"`
+	Record           crecord.FlagConfig                                                `opts:"mode=embedded"`
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error) `opts:"-"`
 	Verbose          bool                                                              `opts:"name=verbose,short=v" help:"Enable verbose logging"`
 }
@@ -68,6 +70,7 @@ type Client struct {
 	stop      func()
 	eg        *errgroup.Group
 	tunnel    *tunnel.Tunnel
+	recorder  *crecord.Recorder
 }
 
 // NewClient creates a new client instance
@@ -192,6 +195,18 @@ func NewClient(c *Config) (*Client, error) {
 		HostKeyCallback: client.verifyServer,
 		Timeout:         settings.EnvDuration("SSH_TIMEOUT", 30*time.Second),
 	}
+	//channel recording is opt-in; when disabled no recorder (and no
+	//record files) exist at all
+	if c.Record.Enabled() {
+		cfg := c.Record.Config("client", settings.Env("RECORD_KEY"))
+		cfg.Logger = client.Logger
+		rec, err := crecord.New(cfg)
+		if err != nil {
+			return nil, err
+		}
+		client.recorder = rec
+		client.Infof("Channel recording enabled (dir %s)", c.Record.Dir)
+	}
 	//prepare client tunnel
 	client.tunnel = tunnel.New(tunnel.Config{
 		Logger:    client.Logger,
@@ -199,6 +214,7 @@ func NewClient(c *Config) (*Client, error) {
 		Outbound:  hasReverse,
 		Socks:     hasReverse && hasSocks,
 		KeepAlive: client.config.KeepAlive,
+		Recorder:  client.recorder,
 	})
 	return client, nil
 }
@@ -325,6 +341,9 @@ func (c *Client) Wait() error {
 func (c *Client) Close() error {
 	if c.stop != nil {
 		c.stop()
+	}
+	if c.recorder != nil {
+		c.recorder.Close()
 	}
 	return nil
 }

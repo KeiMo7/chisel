@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/crecord"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/sizestr"
 	"golang.org/x/crypto/ssh"
@@ -35,6 +37,7 @@ func (t *Tunnel) handleSSHChannels(ctx context.Context, chans <-chan ssh.NewChan
 func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 	if !t.Config.Outbound {
 		t.Debugf("Denied outbound connection")
+		t.recordChannelReject("", crecord.ReasonAuthFailed, errors.New("outbound connections blocked"))
 		ch.Reject(ssh.Prohibited, "Denied outbound connection")
 		return
 	}
@@ -49,6 +52,7 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 	}
 	if socks && t.socksServer == nil {
 		t.Debugf("Denied socks request, please enable socks")
+		t.recordChannelReject(hostPort, crecord.ReasonProtocolError, errors.New("SOCKS5 is not enabled"))
 		ch.Reject(ssh.Prohibited, "SOCKS5 is not enabled")
 		return
 	}
@@ -59,6 +63,7 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 		//missing a "socks" grant, and operators need to see that
 		//without -v
 		t.Infof("Denied connection to %s (ACL)", hostPort)
+		t.recordChannelReject(hostPort, crecord.ReasonAuthFailed, errors.New("access denied by ACL"))
 		ch.Reject(ssh.Prohibited, "access denied")
 		return
 	}
@@ -71,6 +76,7 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 		c, err := d.DialContext(ctx, "tcp", hostPort)
 		if err != nil {
 			t.Debugf("Failed to dial %s: %s", hostPort, err)
+			t.recordChannelReject(hostPort, crecord.ClassifyError(err), err)
 			ch.Reject(ssh.ConnectionFailed, err.Error())
 			return
 		}
@@ -79,6 +85,7 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 	sshChan, reqs, err := ch.Accept()
 	if err != nil {
 		t.Debugf("Failed to accept stream: %s", err)
+		t.recordChannelReject(hostPort, crecord.ClassifyError(err), err)
 		if dst != nil {
 			dst.Close()
 		}
@@ -87,10 +94,16 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 	stream := io.ReadWriteCloser(sshChan)
 	defer stream.Close()
 	go ssh.DiscardRequests(reqs)
-	l := t.Logger.Fork("conn#%d", t.connStats.New())
+	n := t.connStats.New()
+	l := t.Logger.Fork("conn#%d", n)
 	//ready to handle
 	t.connStats.Open()
 	l.Debugf("Open %s", t.connStats.String())
+	//record the channel open: src is the tunnel peer, dst the target
+	chanID := t.nextChannelID()
+	opened := time.Now()
+	t.recordChannelOpen(chanID, "outbound", hostPort, t.peerAddr(), hostPort, opened)
+	var sent, recv int64
 	if socksUDP {
 		if err = writeSocksBytes(stream, []byte(socksUDPReady)); err == nil {
 			err = t.handleSocksUDP(ctx, l, stream)
@@ -100,7 +113,7 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 	} else if udp {
 		err = t.handleUDP(l, stream, hostPort)
 	} else {
-		err = t.handleTCP(l, stream, dst)
+		sent, recv, err = t.handleTCP(l, stream, dst)
 	}
 	t.connStats.Close()
 	errmsg := ""
@@ -108,14 +121,15 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 		errmsg = fmt.Sprintf(" (error %s)", err)
 	}
 	l.Debugf("Close %s%s", t.connStats.String(), errmsg)
+	t.recordChannelClose(chanID, opened, sent, recv, err)
 }
 
 func (t *Tunnel) handleSocks(src io.ReadWriteCloser) error {
 	return t.socksServer.ServeConn(cnet.NewRWCConn(src))
 }
 
-func (t *Tunnel) handleTCP(l *cio.Logger, src io.ReadWriteCloser, dst net.Conn) error {
+func (t *Tunnel) handleTCP(l *cio.Logger, src io.ReadWriteCloser, dst net.Conn) (int64, int64, error) {
 	s, r := cio.Pipe(src, dst)
 	l.Debugf("sent %s received %s", sizestr.ToString(s), sizestr.ToString(r))
-	return nil
+	return s, r, nil
 }
