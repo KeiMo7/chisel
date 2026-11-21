@@ -13,6 +13,7 @@ import (
 	"github.com/armon/go-socks5"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
@@ -28,6 +29,15 @@ type Config struct {
 	//ACL optionally checks if a given address (host:port) is allowed.
 	//When set, outbound connections are denied if this returns false.
 	ACL func(addr string) bool
+	//Quota optionally enables per-channel admission control and rate
+	//limiting. It is shared by every tunnel in the process, so quota state
+	//survives reconnects. Nil (the default) leaves forwarding unchanged.
+	Quota *quota.Set
+	//QuotaScope prefixes quota channel keys with a stable per-tenant string
+	//(on the server, the authenticated user). It keeps two clients with the
+	//same remote from sharing one channel's quota while still giving a given
+	//client the same quota across reconnects. Empty leaves keys unscoped.
+	QuotaScope string
 }
 
 //Tunnel represents an SSH tunnel with proxy capabilities.

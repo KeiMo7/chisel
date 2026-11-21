@@ -16,6 +16,7 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/requestlog"
 	"golang.org/x/crypto/ssh"
@@ -31,6 +32,7 @@ type Config struct {
 	Socks5    bool          `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
 	Reverse   bool          `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
 	KeepAlive time.Duration `opts:"name=keepalive,short=-" help:"An optional keepalive interval. Since the underlying transport is HTTP, in many instances we'll be traversing through proxies, often these proxies will close idle connections. You must specify a time with a unit, for example '5s' or '2m'. Defaults to '25s' (set to 0s to disable)."`
+	Quota     quota.Config  `opts:"mode=embedded"`
 	TLS       TLSConfig     `opts:"mode=embedded"`
 }
 
@@ -44,6 +46,7 @@ type Server struct {
 	sessCount    int32
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+	quota        *quota.Set
 }
 
 var upgrader = websocket.Upgrader{
@@ -75,9 +78,15 @@ func NewServer(c *Config) (*Server, error) {
 			return nil, err
 		}
 	}
+	//validate quota configuration before any listener is created, so an
+	//invalid value fails startup and names the offending option
+	quotaSet, err := quota.NewSet(c.Quota, server.Logger)
+	if err != nil {
+		return nil, server.Errorf("%s", err)
+	}
+	server.quota = quotaSet
 
 	var pemBytes []byte
-	var err error
 	if c.KeyFile != "" {
 		var key []byte
 
@@ -164,6 +173,10 @@ func (s *Server) StartContext(ctx context.Context, host, port string) error {
 	if s.users.Len() > 0 {
 		s.Infof("User authentication enabled")
 	}
+	if s.quota != nil {
+		s.Infof("Per-channel quotas enabled")
+		go s.quota.LogStatsLoop(ctx)
+	}
 	if s.reverseProxy != nil {
 		s.Infof("Reverse proxy enabled")
 	}
@@ -187,7 +200,17 @@ func (s *Server) Wait() error {
 
 // Close forcibly closes the http server
 func (s *Server) Close() error {
+	if s.quota != nil {
+		s.quota.Close()
+	}
 	return s.httpServer.Close()
+}
+
+// Quota exposes the server's per-channel quota state, or nil when quotas are
+// disabled. It is safe to call concurrently and can be used to change limits
+// at runtime or sample usage.
+func (s *Server) Quota() *quota.Set {
+	return s.quota
 }
 
 // GetFingerprint is used to access the server fingerprint

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/opts"
 )
 
@@ -94,13 +95,17 @@ func TestHelpListsEveryFlag(t *testing.T) {
 			"--host", "--port", "--keygen", "--key", "--keyfile", "--authfile",
 			"--auth", "--backend", "--socks5", "--reverse", "--keepalive",
 			"--tls-key", "--tls-cert", "--tls-domain", "--tls-ca", "--proxy",
-			"--pid", "--verbose",
+			"--quota", "--quota-file", "--quota-max-conns", "--quota-max-queue",
+			"--quota-rate", "--quota-queue-timeout", "--quota-idle-timeout",
+			"--quota-stats", "--pid", "--verbose",
 		},
 		"client": {
 			"--fingerprint", "--auth", "--keepalive", "--max-retry-count",
 			"--min-retry-interval", "--max-retry-interval", "--proxy",
 			"--tls-skip-verify", "--tls-ca", "--tls-cert", "--tls-key",
-			"--verbose", "--header", "--hostname", "--sni", "--pid",
+			"--quota", "--quota-file", "--quota-max-conns", "--quota-max-queue",
+			"--quota-rate", "--quota-queue-timeout", "--quota-idle-timeout",
+			"--quota-stats", "--verbose", "--header", "--hostname", "--sni", "--pid",
 		},
 	}
 	for name, newCmd := range helpCommands(t) {
@@ -167,6 +172,13 @@ func TestServerOptions(t *testing.T) {
 		"--tls-domain", "one.example",
 		"--tls-domain", "two.example",
 		"--tls-ca", "ca.pem",
+		"--quota",
+		"--quota-max-conns", "4",
+		"--quota-max-queue", "16",
+		"--quota-rate", "10MB",
+		"--quota-queue-timeout", "5s",
+		"--quota-idle-timeout", "30s",
+		"--quota-stats", "1m",
 		"--pid",
 		"-v",
 	})
@@ -184,6 +196,14 @@ func TestServerOptions(t *testing.T) {
 	}
 	if want := []string{"one.example", "two.example"}; !reflect.DeepEqual(server.Config.TLS.Domains, want) {
 		t.Fatalf("TLS domains: got %q, want %q", server.Config.TLS.Domains, want)
+	}
+	q := server.Config.Quota
+	if !q.Enabled || q.MaxConns != 4 || q.MaxQueue != 16 || int64(q.BytesPerSec) != 10_000_000 ||
+		q.QueueTimeout != 5*time.Second || q.IdleTimeout != 30*time.Second || q.StatsInterval != time.Minute {
+		t.Fatalf("quota options not parsed: %+v", q)
+	}
+	if err := q.Validate(); err != nil {
+		t.Fatalf("parsed quota config invalid: %v", err)
 	}
 }
 
@@ -227,5 +247,11 @@ func TestClientOptions(t *testing.T) {
 	}
 	if client.KeepAlive != 15*time.Second || client.MaxRetryCount != 7 || !client.Config.TLS.SkipVerify || !client.PID || !client.Verbose {
 		t.Fatalf("client options not parsed: %+v", client)
+	}
+	if client.Config.Quota.Enabled {
+		t.Fatalf("client quota enabled without --quota: %+v", client.Config.Quota)
+	}
+	if got := client.Config.Quota.Defaults(); got.MaxConns != quota.DefaultMaxConns {
+		t.Fatalf("client quota defaults lost: %+v", got)
 	}
 }

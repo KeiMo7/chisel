@@ -174,6 +174,46 @@ $ chisel server --help
     specify a time with a unit, for example '5s' or '2m'. Defaults
     to '25s' (set to 0s to disable).
 
+    --quota, Enable per-remote-channel admission quotas. Each remote gets
+    an independent concurrency limit, a bounded wait queue, a byte-rate
+    limit and usage counters. Disabled by default, which keeps the
+    previous unlimited forwarding behaviour and log format.
+
+    --quota-file, An optional JSON file with per-channel quota overrides,
+    for example {"channels":{"3000=>example.com:3000":{"max-conns":2}}}.
+    The file is watched and reloaded at runtime; an invalid update is
+    logged and ignored. Setting this flag enables quotas even without
+    --quota.
+
+    --quota-max-conns, Maximum number of in-flight connections per remote
+    channel when quotas are enabled. Each in-flight connection consumes
+    one SSH channel. Allowed range is 1 to 256. Defaults to 8.
+
+    --quota-max-queue, Maximum number of connections waiting for a
+    per-channel slot when quotas are enabled. When the queue is full, new
+    connections are rejected immediately instead of accumulating. Allowed
+    range is 1 to 4096. Defaults to 32.
+
+    --quota-rate, Aggregate byte-rate limit per remote channel, in both
+    directions, when quotas are enabled. Accepts size suffixes such as
+    10MB or 1MiB. Allowed range is 1B to 1TiB per second. The 1GiB
+    default effectively disables throttling.
+
+    --quota-queue-timeout, Maximum time a connection may wait in a
+    per-channel queue when quotas are enabled. Expired requests are
+    closed and release their queue entry. Defaults to 30s.
+
+    --quota-idle-timeout, Optional per-connection idle timeout for
+    quota-managed channels. A connection that transfers no tunneled bytes
+    in either direction for this long is closed and its quota slot
+    returned, without affecting other channels. Must be 0 (disabled, the
+    default) or positive, e.g. 2m.
+
+    --quota-stats, Log per-channel quota usage (in-flight, queue length,
+    cumulative bytes) at this interval when quotas are enabled. Zero (the
+    default) disables periodic logging; the counters are also available
+    through the Go API.
+
     --backend, Specifies another HTTP server to proxy requests to when
     chisel receives a normal HTTP request. Useful for hiding chisel in
     plain sight. --proxy is accepted as an alias for this flag.
@@ -328,6 +368,46 @@ $ chisel client --help
     proxies, often these proxies will close idle connections. You must
     specify a time with a unit, for example '5s' or '2m'. Defaults
     to '25s' (set to 0s to disable).
+
+    --quota, Enable per-remote-channel admission quotas. Each remote gets
+    an independent concurrency limit, a bounded wait queue, a byte-rate
+    limit and usage counters. Disabled by default, which keeps the
+    previous unlimited forwarding behaviour and log format.
+
+    --quota-file, An optional JSON file with per-channel quota overrides,
+    for example {"channels":{"3000=>example.com:3000":{"max-conns":2}}}.
+    The file is watched and reloaded at runtime; an invalid update is
+    logged and ignored. Setting this flag enables quotas even without
+    --quota.
+
+    --quota-max-conns, Maximum number of in-flight connections per remote
+    channel when quotas are enabled. Each in-flight connection consumes
+    one SSH channel. Allowed range is 1 to 256. Defaults to 8.
+
+    --quota-max-queue, Maximum number of connections waiting for a
+    per-channel slot when quotas are enabled. When the queue is full, new
+    connections are rejected immediately instead of accumulating. Allowed
+    range is 1 to 4096. Defaults to 32.
+
+    --quota-rate, Aggregate byte-rate limit per remote channel, in both
+    directions, when quotas are enabled. Accepts size suffixes such as
+    10MB or 1MiB. Allowed range is 1B to 1TiB per second. The 1GiB
+    default effectively disables throttling.
+
+    --quota-queue-timeout, Maximum time a connection may wait in a
+    per-channel queue when quotas are enabled. Expired requests are
+    closed and release their queue entry. Defaults to 30s.
+
+    --quota-idle-timeout, Optional per-connection idle timeout for
+    quota-managed channels. A connection that transfers no tunneled bytes
+    in either direction for this long is closed and its quota slot
+    returned, without affecting other channels. Must be 0 (disabled, the
+    default) or positive, e.g. 2m.
+
+    --quota-stats, Log per-channel quota usage (in-flight, queue length,
+    cumulative bytes) at this interval when quotas are enabled. Zero (the
+    default) disables periodic logging; the counters are also available
+    through the Go API.
 
     --max-retry-count, Maximum number of times to retry before exiting.
     Defaults to unlimited.
@@ -522,6 +602,193 @@ Less common knobs are environment variables, all read with a `CHISEL_` prefix (e
 
 SOCKS UDP uses hard association and destination limits and drops packets beyond them. Each association queues up to 16 outbound datagrams; full queues drop packets without blocking other clients. For SOCKS UDP, nonpositive size/connection limits or idle deadlines use the defaults, and packet size is capped at 65507 bytes. Operating systems can impose a smaller UDP send limit: macOS defaults to 9216 bytes (`net.inet.udp.maxdgram`). The default 9012-byte Chisel limit fits within that bound.
 
+### Per-channel quotas
+
+By default every remote shares one SSH connection with no per-channel limit:
+a slow target can occupy all of the connection's channels, and a burst on one
+remote raises latency on every other remote. The opt-in quota layer gives each
+remote its own admission gate, bounded wait queue, byte-rate limit and usage
+counters, so a congested channel only pauses its own new requests.
+
+Quotas are off by default. Existing single-remote behaviour, logs and
+flag parsing are unchanged unless `--quota` (or `--quota-file`) is set.
+
+```sh
+# slow intranet service on 3000, fast service on 3001, isolated limits
+chisel client --quota --quota-max-conns 4 --quota-max-queue 8 \
+  --quota-rate 20MB --quota-stats 30s https://server.example \
+  3000:intranet.internal:3000 3001:fast.internal:3001
+```
+
+How it works:
+
+- **Where the gate sits.** A quota is applied where the remote is bound. For
+  a forward remote (`3000:target:3000`) that is the chisel client's proxy; for
+  a reverse remote (`R:2222:localhost:22`) it is the chisel server's proxy.
+  Admission happens *before* an SSH channel is opened, so a saturated channel
+  never consumes a slot on the shared SSH connection.
+- **Channel identity.** The key is the remote's label, the same string in the
+  `proxy#...` log line (`3000=>intranet.internal:3000`, or
+  `R:2222=>localhost:22`). On the server it is prefixed with the authenticated
+  username, so two users declaring the same remote get separate quotas. The
+  quota state lives in a process-wide registry keyed by that string, so
+  reconnecting the tunnel reuses the same counters instead of resetting them.
+- **Independence.** Each channel has its own limiter and wait queue. One
+  channel at its limit pauses only its own new requests and rejects them
+  (`queue full`) once its queue is full; other channels keep forwarding.
+- **Runtime changes.** `--quota-file` is watched and reloaded. Lowering a
+  limit never interrupts in-flight connections: they run to completion, and
+  only new admissions use the new value. `SetLimits`/`SetChannelLimits` on
+  `quota.Set` do the same from library code.
+
+#### Parameters
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--quota` | off | Enable per-channel admission control. |
+| `--quota-file` | none | JSON overrides, watched and reloaded; implies `--quota`. |
+| `--quota-max-conns` | `8` | In-flight connections per channel (1–256). Each in-flight connection is one SSH channel. |
+| `--quota-max-queue` | `32` | Requests waiting for a slot (1–4096). When full, new requests are rejected immediately. |
+| `--quota-rate` | `1GiB` | Aggregate bytes/s per channel, both directions (`10MB`, `1MiB`, or bytes). 1B–1TiB. |
+| `--quota-queue-timeout` | `30s` | How long a request may wait in the queue before it is closed. |
+| `--quota-idle-timeout` | `0` | Optional: close an admitted connection that moves no bytes for this long, returning its slot. |
+| `--quota-stats` | `0` | Optional: log one usage line per channel at this interval. |
+
+Invalid values fail at startup and name the option, for example
+`--quota-max-conns must be between 1 and 256 (got 0)`. If quota accounting
+itself fails, that channel logs a warning and degrades to unlimited
+forwarding instead of stalling.
+
+#### Per-channel overrides
+
+`--quota-file` accepts a JSON object. Values are overlaid on the flags, so a
+file only has to mention the channels it changes:
+
+```json
+{
+  "defaults": { "max-conns": 8, "max-queue": 32 },
+  "channels": {
+    "3000=>intranet.internal:3000": { "max-conns": 2, "max-queue": 4, "rate": "5MB" },
+    "R:2222=>localhost:22": { "max-conns": 16 }
+  }
+}
+```
+
+An absent field inherits; an explicit zero or out-of-range value is rejected.
+Editing the file applies new limits to live channels within about 100 ms; an
+invalid update is logged and the previous limits remain in force.
+
+On a server with `--auth`, reverse-channel keys carry the username prefix
+(`alice/R:2222=>localhost:22`), so a quota-file entry for a reverse remote must
+include it. Forward remotes on the client are not prefixed.
+
+#### Inspecting usage
+
+`quota.Set` (returned by `Server.Quota()` and `Client.Quota()`) exposes
+`Stats()` and `StatsJSON()`; `--quota-stats` logs the same counters. The
+`example/quota-sample` program runs three channels through an in-process pair
+and prints a sample:
+
+```sh
+go run ./example/quota-sample
+```
+
+```json
+[
+  {
+    "channel": "44645=>45237",
+    "in-flight": 3,
+    "queued": 4,
+    "max-conns": 3,
+    "max-queue": 4,
+    "rate": 1073741824,
+    "bytes": 12,
+    "admitted": 3,
+    "rejected": 0,
+    "timed-out": 0,
+    "degraded": false
+  },
+  {
+    "channel": "44857=>45793",
+    "in-flight": 0,
+    "queued": 0,
+    "max-conns": 3,
+    "max-queue": 4,
+    "rate": 1073741824,
+    "bytes": 6320,
+    "admitted": 790,
+    "rejected": 0,
+    "timed-out": 0,
+    "degraded": false
+  }
+]
+```
+
+(Ports and byte counts vary per run; the first channel is the saturated slow
+one — `in-flight: 3, queued: 4`, full — while the fast channel keeps
+completing requests and shows no failed or queued admissions.)
+
+Read it per channel: `in-flight`/`queued` show current occupancy, `bytes` is
+cumulative both directions, and `admitted`/`rejected`/`timed-out` are
+cumulative decisions. An `in-flight` at `max-conns` with `queued` at
+`max-queue` is a fully saturated channel; it does not raise the counters of
+any other channel.
+
+#### Known limitations
+
+- Quotas apply to TCP forwarding via proxies. SOCKS and `udpsocks` remotes use
+  their own association limits (`CHISEL_UDP_MAX_CONNS`); the two are not
+  combined.
+- `--quota-max-conns` is capped at 256 because each in-flight connection holds
+  one SSH channel and its flow-control window.
+- The rate limit is a token bucket with a one-second burst, shared by both
+  directions of a channel. It is a fair-share throttle, not a shaper: a burst
+  smaller than one second's allowance passes immediately.
+- Quota state is per process. A server restart starts counters at zero; each
+  chisel client keeps its own state.
+- Quotas do not replace the ACL or authentication. They only bound resource
+  use of channels that are already authorised.
+
+#### Overhead and concurrency notes
+
+The disabled path is unchanged: `Config.Quota` is nil, `Acquire` is a method
+call on a nil pointer returning `(nil, nil)`, and `pipeRemote` keeps its
+original `cio.Pipe(src, dst)` (the local variables still point at the original
+connections). No mutex, goroutine or wrapper is created.
+
+With quotas enabled:
+
+- **Admission** takes one limiter mutex per connection (not per byte). The
+  queued path adds one channel and one timer per waiting request, bounded by
+  `--quota-max-queue`.
+- **Byte accounting** adds an atomic add and a token-bucket check per `Write`.
+  The bucket has its own mutex so throttling never blocks admission or the
+  other direction's accounting; when the bucket has enough tokens the lock is
+  held for a few instructions.
+- **No extra copies**: `throttled.Read`/`Write` pass the caller's buffer
+  straight through, so bytes are not buffered again. `CloseWrite` is preserved
+  for half-close propagation.
+- Each admitted connection is still one SSH channel; quotas do not change the
+  multiplexing topology.
+
+A whole-tunnel comparison with identical input (one 4 KiB echo round trip per
+operation over loopback, 16 parallel clients) is available as a benchmark:
+
+```sh
+go test ./test/e2e -run '^$' -bench '^BenchmarkQuotaForward/' -benchmem -benchtime=3s -count=5
+```
+
+On an 8-core Ryzen 7 9700X (Linux/amd64, Go 1.27.0), five runs gave a median
+of 520,885 ns/op (~1.9k ops/s, ~7.9 MB/s) with quotas disabled and
+484,978 ns/op (~2.1k ops/s, ~8.4 MB/s) with quotas enabled — the enabled
+median came out slightly *lower*, i.e. within run-to-run noise for a loopback
+round trip dominated by TCP and SSH framing. Individual runs spanned roughly
+470–550 µs/op in both modes, so there is no measurable regression from the
+admission and accounting layer. Allocation counts are stable at 247 vs 253
+per operation; the six extra allocations are the per-connection lease and its
+wrapper. `BenchmarkQuotaWrapIO` also shows 0 allocations per 32 KiB write on
+the enabled path.
+
 #### Caveats
 
 Since WebSockets support is required:
@@ -569,6 +836,7 @@ Since WebSockets support is required:
   - `go install` builds report their real version; sessions and failed logins are logged at info level
   - release binaries are built with Go 1.27.0; `x/crypto/ssh` is updated to v0.55.0 to address GO-2026-6303
   - releases now ship ko-built, scratch-based multi-arch images with CA roots to GHCR and Docker Hub; releasing is two-stage — tagging builds a draft GitHub release plus version-tagged images, and publishing the draft promotes the Docker `latest` / `X` / `X.Y` tags
+- `1.13` - Opt-in per-channel quotas (`--quota`): independent in-flight and queue limits, a byte-rate cap and usage counters per remote, with hot-reloadable overrides (`--quota-file`). Disabled by default; forwarding and logs are unchanged without the flag.
 
 ### Upgrading to 1.12
 

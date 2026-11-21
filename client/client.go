@@ -21,6 +21,7 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/chisel/share/tunnel"
 
@@ -41,6 +42,7 @@ type Config struct {
 	Proxy            string                                                            `opts:"name=proxy,short=-" help:"An optional HTTP CONNECT or SOCKS5 proxy which will be used to reach the chisel server. Authentication can be specified inside the URL. Credentials must be URL-encoded; for example a \"#\" in the password must be written as \"%23\".\nFor example, http://admin:password@my-server.com:8081\n        or: socks://admin:password@my-server.com:1080\nThe socks://, socks5:// and socks5h:// schemes are equivalent: DNS is always resolved by the proxy."`
 	Remotes          []string                                                          `opts:"name=remote,mode=arg,min=1"`
 	Headers          http.Header                                                       `opts:"-"`
+	Quota            quota.Config                                                      `opts:"mode=embedded"`
 	TLS              TLSConfig                                                         `opts:"mode=embedded"`
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error) `opts:"-"`
 	Verbose          bool                                                              `opts:"name=verbose,short=v" help:"Enable verbose logging"`
@@ -68,6 +70,7 @@ type Client struct {
 	stop      func()
 	eg        *errgroup.Group
 	tunnel    *tunnel.Tunnel
+	quota     *quota.Set
 }
 
 // NewClient creates a new client instance
@@ -192,6 +195,13 @@ func NewClient(c *Config) (*Client, error) {
 		HostKeyCallback: client.verifyServer,
 		Timeout:         settings.EnvDuration("SSH_TIMEOUT", 30*time.Second),
 	}
+	//validate quota configuration before any listener is created, so an
+	//invalid value fails startup and names the offending option
+	quotaSet, err := quota.NewSet(c.Quota, client.Logger)
+	if err != nil {
+		return nil, err
+	}
+	client.quota = quotaSet
 	//prepare client tunnel
 	client.tunnel = tunnel.New(tunnel.Config{
 		Logger:    client.Logger,
@@ -199,6 +209,7 @@ func NewClient(c *Config) (*Client, error) {
 		Outbound:  hasReverse,
 		Socks:     hasReverse && hasSocks,
 		KeepAlive: client.config.KeepAlive,
+		Quota:     client.quota,
 	})
 	return client, nil
 }
@@ -255,6 +266,10 @@ func (c *Client) verifyLegacyFingerprint(key ssh.PublicKey) error {
 func (c *Client) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	c.stop = cancel
+	if c.quota != nil {
+		c.Infof("Per-channel quotas enabled")
+		go c.quota.LogStatsLoop(ctx)
+	}
 	eg, ctx := errgroup.WithContext(ctx)
 	c.eg = eg
 	via := ""
@@ -316,6 +331,13 @@ func (c *Client) Ready(ctx context.Context) bool {
 	return c.tunnel.Ready(ctx)
 }
 
+// Quota exposes the client's per-channel quota state, or nil when quotas are
+// disabled. It is safe to call concurrently and can be used to change limits
+// at runtime or sample usage.
+func (c *Client) Quota() *quota.Set {
+	return c.quota
+}
+
 // Wait blocks while the client is running.
 func (c *Client) Wait() error {
 	return c.eg.Wait()
@@ -325,6 +347,9 @@ func (c *Client) Wait() error {
 func (c *Client) Close() error {
 	if c.stop != nil {
 		c.stop()
+	}
+	if c.quota != nil {
+		c.quota.Close()
 	}
 	return nil
 }

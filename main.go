@@ -15,6 +15,7 @@ import (
 	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cos"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/opts"
 )
@@ -167,6 +168,8 @@ type serverOptions struct {
 func newServerOptions() *serverOptions {
 	o := &serverOptions{}
 	o.Config.KeepAlive = 25 * time.Second
+	//quota knobs have non-zero defaults, applied only when --quota is set
+	o.Config.Quota = quota.DefaultConfig()
 	o.ProxyAlias.target = &o.Config.Proxy
 	return o
 }
@@ -322,6 +325,7 @@ func newClientOptions() *clientOptions {
 	o := &clientOptions{}
 	o.Config.KeepAlive = 25 * time.Second
 	o.Config.MaxRetryCount = -1
+	o.Config.Quota = quota.DefaultConfig()
 	o.Config.Headers = http.Header{}
 	return o
 }

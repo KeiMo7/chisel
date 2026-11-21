@@ -162,6 +162,11 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		Outbound:  true, //server always accepts outbound
 		Socks:     s.config.Socks5,
 		KeepAlive: s.config.KeepAlive,
+		Quota:     s.quota,
+		//separate reverse channels of different users which happen to share
+		//a remote definition; an authenticated user keeps the same key
+		//across reconnects ("-" means auth is disabled, i.e. unscoped)
+		QuotaScope: scopeUser(username),
 	}
 	//enforce ACL on every channel, not just the initial config.
 	//the user is re-resolved from the live index per channel, so
@@ -196,6 +201,15 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	}
 	l.Infof("Close (user=%s addr=%s duration=%s)%s",
 		username, req.RemoteAddr, time.Since(opened), errmsg)
+}
+
+// scopeUser maps the authenticated username (or "-" when auth is disabled)
+// to a quota scope.
+func scopeUser(username string) string {
+	if username == "-" {
+		return ""
+	}
+	return username
 }
 
 func (s *Server) logHandshakeFailure(err error) {
