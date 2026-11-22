@@ -1,0 +1,8 @@
+{
+	"alice:$2a$10$MV9kKvYqpJcyjOT7RuYmZ.BtRypg0tGUbZxS311Y5bzHKqC5vRyCq": [
+		""
+	],
+	"bob:$2a$10$rk433LHWuRxrbCboAe38U.PkmBJJBQeB7RBrlQyM8B0H1Jb5Bsa5u": [
+		"^socks$"
+	]
+}

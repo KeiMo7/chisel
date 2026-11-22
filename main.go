@@ -65,7 +65,13 @@ func newCLI(serverConfig *serverOptions, clientConfig *clientOptions) opts.Opts 
 		Repo(chiselRepo).
 		DocSet("version", versionTemplate).
 		AddCommand(newServerCLI(serverConfig)).
-		AddCommand(newClientCLI(clientConfig))
+		AddCommand(newClientCLI(clientConfig)).
+		AddCommand(opts.New(&hashpwOptions{}).Name("hashpw").
+			Summary("hashes a password with bcrypt (read from stdin) and prints the hash for use in an authfile").
+			Repo(chiselRepo)).
+		AddCommand(opts.New(&migrateAuthfileOptions{}).Name("migrate-authfile").
+			Summary("converts plaintext passwords in an authfile to bcrypt hashes, keeping a backup").
+			Repo(chiselRepo))
 }
 
 func newServerCLI(serverConfig *serverOptions) opts.Opts {
@@ -137,6 +143,22 @@ func generatePidFile() error {
 	return os.WriteFile("chisel.pid", pid, 0644)
 }
 
+// credentialOnArgv reports whether the resolved credential material appears
+// in the raw process arguments. It compares against the resolved value (and
+// its ":secret" suffix), so warnings fire for the legacy literal form but
+// not for @file indirection. The secret is only compared, never printed.
+func credentialOnArgv(argv []string, resolved string) bool {
+	for _, a := range argv {
+		if a == "" || a[0] == '-' {
+			continue
+		}
+		if a == resolved || strings.Contains(a, resolved) {
+			return true
+		}
+	}
+	return false
+}
+
 type sharedStringFlag struct {
 	target *string
 }
@@ -203,6 +225,21 @@ func (o *serverOptions) Run() error {
 	}
 	if config.Auth == "" {
 		config.Auth = os.Getenv("AUTH")
+	}
+	if config.Auth != "" {
+		// Flag/env values may use "@file" or "@-" indirection so the secret
+		// never sits in the process argument list.
+		resolved, err := settings.ResolveCredential(config.Auth)
+		if err != nil {
+			return err
+		}
+		config.Auth = resolved
+		// Warn when the credential really did arrive as a visible argument.
+		// Environment-variable and @file indirection stay quiet.
+		if credentialOnArgv(os.Args, config.Auth) {
+			log.Print("Warning: passing credentials via --auth exposes them in the process argument list; " +
+				"prefer the AUTH environment variable, `--auth @/path/to/credential`, or an --authfile with bcrypt hashes (`chisel hashpw`, `chisel migrate-authfile`)")
+		}
 	}
 	s, err := chserver.NewServer(config)
 	if err != nil {
@@ -336,6 +373,17 @@ func (o *clientOptions) Run() error {
 	//default auth
 	if config.Auth == "" {
 		config.Auth = os.Getenv("AUTH")
+	}
+	if config.Auth != "" {
+		resolved, err := settings.ResolveCredential(config.Auth)
+		if err != nil {
+			return err
+		}
+		config.Auth = resolved
+		if credentialOnArgv(os.Args, config.Auth) {
+			log.Print("Warning: passing credentials via --auth exposes them in the process argument list; " +
+				"prefer the AUTH environment variable or `--auth @/path/to/credential`")
+		}
 	}
 	//move hostname onto headers
 	if o.Hostname != "" {

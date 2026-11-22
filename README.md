@@ -409,13 +409,26 @@ Using the `--authfile` option, the server may optionally provide a `user.json` c
 
 Notes on authfile behavior:
 
-- The file is watched and **reloaded live** — including editor saves via rename (vim) and kubernetes configmap updates. Reloads apply to new connections and to new tunnels of already-connected clients; removed users lose access to new tunnels immediately, though established tunnels are not interrupted.
+- **Password hashing (recommended).** The secret half of an entry may be a bcrypt hash instead of a plaintext password. Generate one with `chisel hashpw` (the password is read from stdin, never from the command line) and put the resulting `$2a$…` value in the key:
+  ```sh
+  echo -n 's3cr3t' | chisel hashpw
+  # -> $2a$10$....  (algorithm and cost are embedded in the hash)
+  ```
+  ```json
+  { "alice:$2a$10$....": [""] }
+  ```
+  Bcrypt is a salted, tunable-cost hash from `golang.org/x/crypto`; chisel does not implement its own password algorithm. Plaintext and hashed entries may be mixed in one file — each entry is verified with its own form, so hashed accounts never fall back to plaintext comparison.
+- **Migrating an existing plaintext authfile.** `chisel migrate-authfile users.json` parses and validates the whole file first, writes a timestamped `.bak` backup, then atomically replaces it with a fully-bcrypt version (mode `0600`). A failure before the replace leaves the original file usable; the backup is retained for rollback. On load, the server logs a one-line hint naming the file and the count of plaintext entries remaining.
+- The file is watched and **reloaded live** — including editor saves via rename (vim) and kubernetes configmap updates. Reloads apply to new connections and to new tunnels of already-connected clients; removed users lose access to new tunnels immediately, though established tunnels are not interrupted. A corrupt or unparseable reload is rejected and the previously loaded users stay active.
+- **Fail-closed hash handling.** An unrecognized hash format (any `$`-prefixed value that is not bcrypt) or an out-of-range bcrypt cost aborts startup and names the offending user, rather than silently comparing the value as plaintext.
 - Address patterns are regular expressions and are **not anchored** — anchor them with `^` and `$` (the server warns about unanchored patterns at load). The empty string `""` matches everything.
 - SOCKS5 access is controlled by an entry matching the token `socks`. **Breaking**: SOCKS5 previously bypassed the authfile entirely; servers running `--socks5` with `--authfile` must grant `socks` to users who should keep proxy access (wildcard `""` entries keep working).
 - Auth strings without a colon (`user:pass`) are now a **fatal startup error** on both server and client — previously they silently disabled authentication.
 - The `--auth` user survives authfile reloads and wins name clashes with file users.
+- **Keeping secrets off the process argument list.** A password passed as `--auth user:pass` is visible via the process arguments (`ps`, `/proc/<pid>/cmdline`); chisel logs a warning when it detects this. Prefer, in order: a hashed `--authfile`, the `AUTH` environment variable, or file indirection — `--auth @/path/to/credential` (or `--auth @-` to read from stdin) reads the same `user:pass` value without placing it in argv.
+- **File permissions.** On POSIX systems chisel warns at load when the authfile is group/world readable or writable; restrict it to owner-only access (e.g. `chmod 600`).
 
-Internally, this is done using the _Password_ authentication method provided by SSH. Learn more about `crypto/ssh` here http://blog.gopheracademy.com/go-and-ssh/. Session opens/closes (with user, source address and remotes) and failed login attempts are logged at info level.
+Internally, this is done using the _Password_ authentication method provided by SSH. Learn more about `crypto/ssh` here http://blog.gopheracademy.com/go-and-ssh/. Session opens/closes (with user, source address and remotes) and failed login attempts are logged at info level. Failed-login log lines contain only the username, source address and a reason category (`bad-credentials` or `unknown-user`) — never the presented password, even as a fragment. "Unknown user" and "wrong password" return the same error shape and run the same bcrypt-strength comparison so the two cases are not distinguishable by response or timing. Bcrypt verification runs behind a bounded concurrency gate (`CHISEL_AUTH_CONCURRENCY`, defaulting to GOMAXPROCS) so an auth flood cannot pin every core.
 
 ### TLS Guide
 

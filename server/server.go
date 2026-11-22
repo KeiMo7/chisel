@@ -2,7 +2,6 @@ package chserver
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -25,8 +24,8 @@ import (
 type Config struct {
 	KeySeed   string        `opts:"name=key,short=-" help:"(deprecated use --keygen and --keyfile instead) An optional string to seed the generation of a ECDSA public and private key pair. All communications will be secured using this key pair. Share the subsequent fingerprint with clients to enable detection of man-in-the-middle attacks (defaults to the CHISEL_KEY environment variable, otherwise a new key is generate each run)."`
 	KeyFile   string        `opts:"name=keyfile,short=-" help:"An optional path to a PEM-encoded SSH private key. When this flag is set, the --key option is ignored, and the provided private key is used to secure all communications. (defaults to the CHISEL_KEY_FILE environment variable). Since ECDSA keys are short, you may also set keyfile to the inline key string itself, exactly as printed by --keygen (a base64 string with a \"ck-\" prefix); no extra base64 encoding is needed."`
-	AuthFile  string        `opts:"name=authfile,short=-" help:"An optional path to a users.json file. This file should be an object with users defined like:\n  {\n    \"<user:pass>\": [\"<addr-regex>\",\"<addr-regex>\"]\n  }\nwhen <user> connects, their <pass> will be verified and then each of the remote addresses will be compared against the list of address regular expressions for a match. Patterns are NOT anchored by default: \"10.0.0.1:80\" also matches \"210.0.0.1:8080\", and \".\" matches any character. Anchor your patterns, e.g. \"^10\\.0\\.0\\.1:80$\". The empty string \"\" matches every address. Addresses will always come in the form \"<remote-host>:<remote-port>\" for normal remotes, \"R:<local-interface>:<local-port>\" for reverse port forwarding remotes, and \"socks\" for SOCKS5 proxy access. Note that SOCKS5 access previously bypassed this list; existing authfiles which should allow SOCKS5 must add an entry matching \"socks\" (the empty wildcard \"\" matches everything, including \"socks\"). This file will be automatically reloaded on change. Reloads apply to new connections and to new tunnels of connected clients; established tunnels are not interrupted."`
-	Auth      string        `opts:"name=auth,short=-" help:"An optional string representing a single user with full access, in the form of <user:pass>. It is equivalent to creating an authfile with {\"<user:pass>\": [\"\"]}. If unset, it will use the environment variable AUTH."`
+	AuthFile  string        `opts:"name=authfile,short=-" help:"An optional path to a users.json file. This file should be an object with users defined like:\n  {\n    \"<user:pass>\": [\"<addr-regex>\",\"<addr-regex>\"]\n  }\nThe <pass> half may be either a plaintext password (legacy) or a bcrypt hash produced by 'chisel hashpw' ($2a$/$2b$/$2y$; the algorithm and cost are stored inside the hash). Plaintext and hashed entries may be mixed; each entry is verified on its own form. Run 'chisel migrate-authfile <file>' to convert an existing file in place (a .bak backup is kept). Unknown hash formats and out-of-range bcrypt costs fail startup and name the offending user. when <user> connects, their <pass> will be verified and then each of the remote addresses will be compared against the list of address regular expressions for a match. Patterns are NOT anchored by default: \"10.0.0.1:80\" also matches \"210.0.0.1:8080\", and \".\" matches any character. Anchor your patterns, e.g. \"^10\\.0\\.0\\.1:80$\". The empty string \"\" matches every address. Addresses will always come in the form \"<remote-host>:<remote-port>\" for normal remotes, \"R:<local-interface>:<local-port>\" for reverse port forwarding remotes, and \"socks\" for SOCKS5 proxy access. Note that SOCKS5 access previously bypassed this list; existing authfiles which should allow SOCKS5 must add an entry matching \"socks\" (the empty wildcard \"\" matches everything, including \"socks\"). This file will be automatically reloaded on change. Reloads apply to new connections and to new tunnels of connected clients; established tunnels are not interrupted."`
+	Auth      string        `opts:"name=auth,short=-" help:"An optional string representing a single user with full access, in the form of <user:pass>. It is equivalent to creating an authfile with {\"<user:pass>\": [\"\"]}. If unset, it will use the environment variable AUTH. Passing the secret on the command line leaves it visible in the process argument list; prefer AUTH, or use --auth @/path/to/credential (or --auth @- for stdin) to read the same <user:pass> value from a file. For stored hashes use --authfile with bcrypt entries (see 'chisel hashpw')."`
 	Proxy     string        `opts:"name=backend,short=-" help:"Specifies another HTTP server to proxy requests to when chisel receives a normal HTTP request. Useful for hiding chisel in plain sight. --proxy is accepted as an alias for this flag."`
 	Socks5    bool          `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
 	Reverse   bool          `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
@@ -44,6 +43,7 @@ type Server struct {
 	sessCount    int32
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+	auth         *authGate
 }
 
 var upgrader = websocket.Upgrader{
@@ -61,6 +61,11 @@ func NewServer(c *Config) (*Server, error) {
 	}
 	server.Info = true
 	server.users = settings.NewUserIndex(server.Logger)
+	gate, err := newAuthGate()
+	if err != nil {
+		return nil, server.Errorf("failed to initialize password hashing: %s", err)
+	}
+	server.auth = gate
 	//pin the --auth user first so authfile reloads cannot drop it
 	if c.Auth != "" {
 		u := &settings.User{Addrs: []*regexp.Regexp{settings.UserAllowAll}}
@@ -77,7 +82,6 @@ func NewServer(c *Config) (*Server, error) {
 	}
 
 	var pemBytes []byte
-	var err error
 	if c.KeyFile != "" {
 		var key []byte
 
@@ -204,9 +208,18 @@ func (s *Server) authUser(c ssh.ConnMetadata, password []byte) (*ssh.Permissions
 	// check the user exists and has matching password
 	n := c.User()
 	user, found := s.users.Get(n)
-	if !found || subtle.ConstantTimeCompare([]byte(user.Pass), password) != 1 {
-		//info level: operators should see failed attempts (#521)
-		s.Infof("Login failed for user %q (%s)", n, c.RemoteAddr())
+	// The gate equalizes timing and error surface between "unknown user"
+	// and "wrong password": both run a bcrypt-strength comparison and both
+	// return the same error category. The presented password is never read
+	// into a log line or error string.
+	if !s.auth.verify(user, found, string(password)) {
+		reason := "bad-credentials"
+		if !found {
+			reason = "unknown-user"
+		}
+		//info level: operators should see failed attempts (#521). Only the
+		//username, source and reason category are logged — never the secret.
+		s.Infof("Login failed for user %q (%s) reason=%s", n, c.RemoteAddr(), reason)
 		return nil, fmt.Errorf("invalid authentication for username: %s", n)
 	}
 	// pass the username through to the handshake handler, which

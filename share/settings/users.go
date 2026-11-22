@@ -198,7 +198,9 @@ func samePath(a, b string) bool {
 	return a == b
 }
 
-// loadUserIndex is responsible for loading the users configuration
+// loadUserIndex is responsible for loading the users configuration. A
+// failed parse never swaps the live index, so a half-written or corrupt
+// file leaves the previously loaded users in place.
 func (u *UserIndex) loadUserIndex() error {
 	if u.configFile == "" {
 		return errors.New("configuration file not set")
@@ -207,16 +209,62 @@ func (u *UserIndex) loadUserIndex() error {
 	if err != nil {
 		return fmt.Errorf("Failed to read auth file: %s, error: %s", u.configFile, err)
 	}
+	warnIfAuthFilePermissive(u.Logger, u.configFile)
+	users, plaintext, warnings, err := ParseUsers(b)
+	if err != nil {
+		return err
+	}
+	for _, w := range warnings {
+		u.Infof("%s", w)
+	}
+	if plaintext > 0 {
+		// Migration hint, emitted on every (re)load while plaintext entries
+		// remain so operators know which direction to move. No secrets are
+		// logged, only the count.
+		u.Infof("authfile %s: %d entr%s stored as plaintext passwords; "+
+			"run `chisel migrate-authfile %s` to convert them to bcrypt hashes",
+			u.configFile, plaintext, plural(plaintext, "y", "ies"), u.configFile)
+	}
+	//swap, keeping pinned users (pinned last: they win name clashes)
+	u.Reset(append(users, u.pinned...))
+	return nil
+}
+
+func plural(n int, singular, pluralForm string) string {
+	if n == 1 {
+		return singular
+	}
+	return pluralForm
+}
+
+// ParseUsers parses the authfile JSON into users, classifying each secret
+// individually: bcrypt hashes populate User.Hash, everything else is kept
+// as a legacy plaintext User.Pass. Unknown hash encodings and invalid bcrypt
+// parameters fail the whole load and name the offending username without
+// ever embedding the secret. The second return value is the number of
+// plaintext entries found.
+func ParseUsers(b []byte) (users []*User, plaintext int, warnings []string, err error) {
 	var raw map[string][]string
 	if err := json.Unmarshal(b, &raw); err != nil {
-		return errors.New("Invalid JSON: " + err.Error())
+		return nil, 0, nil, errors.New("Invalid JSON: " + err.Error())
 	}
-	users := []*User{}
+	users = []*User{}
+	plaintext = 0
 	for auth, remotes := range raw {
 		user := &User{}
-		user.Name, user.Pass = ParseAuth(auth)
+		var secret string
+		user.Name, secret = ParseAuth(auth)
 		if user.Name == "" {
-			return errors.New("Invalid user:pass string")
+			return nil, 0, nil, errors.New("Invalid user:pass string")
+		}
+		if err := ValidateStoredSecret(secret); err != nil {
+			return nil, 0, nil, fmt.Errorf("authfile entry for user %q: %s", user.Name, err.Error())
+		}
+		if IsBcryptHash(secret) {
+			user.Hash = secret
+		} else {
+			user.Pass = secret
+			plaintext++
 		}
 		for _, r := range remotes {
 			if r == "" || r == "*" {
@@ -224,18 +272,17 @@ func (u *UserIndex) loadUserIndex() error {
 			} else {
 				re, err := regexp.Compile(r)
 				if err != nil {
-					return errors.New("Invalid address regex")
+					return nil, 0, nil, fmt.Errorf("authfile entry for user %q: invalid address regex", user.Name)
 				}
 				if !strings.HasPrefix(r, "^") || !strings.HasSuffix(r, "$") {
-					u.Infof("authfile: pattern %q (user %s) is unanchored and "+
-						"may match unintended addresses; anchor it with ^ and $", r, user.Name)
+					warnings = append(warnings, fmt.Sprintf(
+						"authfile: pattern %q (user %s) is unanchored and "+
+							"may match unintended addresses; anchor it with ^ and $", r, user.Name))
 				}
 				user.Addrs = append(user.Addrs, re)
 			}
 		}
 		users = append(users, user)
 	}
-	//swap, keeping pinned users (pinned last: they win name clashes)
-	u.Reset(append(users, u.pinned...))
-	return nil
+	return users, plaintext, warnings, nil
 }
