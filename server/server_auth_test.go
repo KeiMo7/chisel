@@ -81,7 +81,9 @@ func TestAuthUserFailedLoginQuotesUsername(t *testing.T) {
 		t.Fatalf("authentication error changed: got %q, want %q", got, want)
 	}
 
-	const wantLog = "server: Login failed for user \"mallory\\nserver: forged\\r\\t\\x00\" (192.0.2.10:2222)\n"
+	// The failure log records the source host (port stripped) because the
+	// lockout limiter aggregates by source address, not by ephemeral port.
+	const wantLog = "server: Login failed for user \"mallory\\nserver: forged\\r\\t\\x00\" (192.0.2.10)\n"
 	if got := logs.String(); got != wantLog {
 		t.Fatalf("unexpected failed-login log:\n got: %q\nwant: %q", got, wantLog)
 	}

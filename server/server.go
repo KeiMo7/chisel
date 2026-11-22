@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jpillora/chisel/server/authlimit"
 	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
@@ -31,7 +32,29 @@ type Config struct {
 	Socks5    bool          `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
 	Reverse   bool          `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
 	KeepAlive time.Duration `opts:"name=keepalive,short=-" help:"An optional keepalive interval. Since the underlying transport is HTTP, in many instances we'll be traversing through proxies, often these proxies will close idle connections. You must specify a time with a unit, for example '5s' or '2m'. Defaults to '25s' (set to 0s to disable)."`
-	TLS       TLSConfig     `opts:"mode=embedded"`
+	// AuthLimit tunes authentication failure lockouts. The zero value is
+	// replaced with safe defaults in NewServer when any authentication is
+	// configured; it is inert when authentication is disabled.
+	AuthLimit AuthLimitConfig `opts:"mode=embedded"`
+	TLS       TLSConfig       `opts:"mode=embedded"`
+}
+
+// AuthLimitConfig controls the in-memory authentication failure limiter.
+// Failures are counted per source address and per account over a sliding
+// window; crossing a threshold arms a cooldown during which every attempt
+// (including correct passwords) is rejected before the SSH handshake
+// completes. All state is in-memory and is lost on restart.
+type AuthLimitConfig struct {
+	SourceFailures  int           `opts:"name=auth-limit-source-failures,short=-" help:"Number of failed authentications from one source address within the auth-limit window before the source is put into cooldown. Default 10 (env CHISEL_AUTH_LIMIT_SOURCE_FAILURES)."`
+	AccountFailures int           `opts:"name=auth-limit-account-failures,short=-" help:"Number of failed authentications against one account within the auth-limit window before the account is put into cooldown. Default 10 (env CHISEL_AUTH_LIMIT_ACCOUNT_FAILURES)."`
+	Window          time.Duration `opts:"name=auth-limit-window,short=-" help:"Sliding window over which authentication failures are counted. Default 5m (env CHISEL_AUTH_LIMIT_WINDOW)."`
+	Cooldown        time.Duration `opts:"name=auth-limit-cooldown,short=-" help:"Duration of the cooldown armed when a failure threshold is crossed. During cooldown every attempt is rejected, including attempts with the correct password. Default 10m (env CHISEL_AUTH_LIMIT_COOLDOWN)."`
+	MaxSources      int           `opts:"name=auth-limit-max-sources,short=-" help:"Maximum number of source addresses whose failure state is tracked. Default 10000 (env CHISEL_AUTH_LIMIT_MAX_SOURCES). When the cap is hit, expired then oldest-unlocked entries are evicted and an alert is logged; locked entries are never evicted."`
+	MaxAccounts     int           `opts:"name=auth-limit-max-accounts,short=-" help:"Maximum number of accounts whose failure state is tracked. Default 10000 (env CHISEL_AUTH_LIMIT_MAX_ACCOUNTS). Eviction behaves like --auth-limit-max-sources."`
+	// AdminAddr optionally enables a local operator HTTP endpoint on the
+	// given host:port for viewing counters and manually clearing cooldowns.
+	// Empty disables it. Intended to be bound to localhost.
+	AdminAddr string `opts:"name=auth-admin,short=-" help:"Optional host:port for the local authentication-lockout administration endpoint (view current counters and clear cooldowns). Disabled by default (env CHISEL_AUTH_ADMIN); bind to localhost only."`
 }
 
 // Server represent a chisel service
@@ -44,6 +67,9 @@ type Server struct {
 	sessCount    int32
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+	authLimiter  *authlimit.Limiter
+	authAdmin    *authAdmin
+	adminCancel  context.CancelFunc
 }
 
 var upgrader = websocket.Upgrader{
@@ -76,8 +102,23 @@ func NewServer(c *Config) (*Server, error) {
 		}
 	}
 
+	// Build the authentication failure limiter. It only participates when
+	// user authentication is enabled (see authUser's allow-all shortcut),
+	// so no-auth deployments keep their existing behaviour exactly.
+	if err := validateAuthLimitInputs(c.AuthLimit); err != nil {
+		return nil, server.Errorf("%s", err)
+	}
+	limiterCfg := authLimitConfig(c.AuthLimit)
+	if err := limiterCfg.Validate(); err != nil {
+		return nil, server.Errorf("%s", err)
+	}
+	limiter, err := authlimit.New(limiterCfg, server.Logger)
+	if err != nil {
+		return nil, server.Errorf("%s", err)
+	}
+	server.authLimiter = limiter
+
 	var pemBytes []byte
-	var err error
 	if c.KeyFile != "" {
 		var key []byte
 
@@ -162,13 +203,29 @@ func (s *Server) Start(host, port string) error {
 func (s *Server) StartContext(ctx context.Context, host, port string) error {
 	s.Infof("Fingerprint %s", s.fingerprint)
 	if s.users.Len() > 0 {
+		eff := authLimitConfig(s.config.AuthLimit)
 		s.Infof("User authentication enabled")
+		s.Infof("Auth failure lockout: %d failures/source or %d failures/account "+
+			"within %s arms a %s cooldown",
+			eff.SourceFailures, eff.AccountFailures, eff.Window, eff.Cooldown)
 	}
 	if s.reverseProxy != nil {
 		s.Infof("Reverse proxy enabled")
 	}
+	//start the background reaper and optional admin endpoint for the
+	//in-memory auth failure store; both are inert when auth is disabled
+	reaperCtx, cancel := context.WithCancel(ctx)
+	s.adminCancel = cancel
+	s.authLimiter.StartReaper(reaperCtx, time.Minute)
+	if s.config.AuthLimit.AdminAddr != "" {
+		if err := s.startAuthAdmin(reaperCtx); err != nil {
+			cancel()
+			return err
+		}
+	}
 	l, err := s.listener(host, port)
 	if err != nil {
+		cancel()
 		return err
 	}
 	h := http.Handler(http.HandlerFunc(s.handleClientHandler))
@@ -187,7 +244,30 @@ func (s *Server) Wait() error {
 
 // Close forcibly closes the http server
 func (s *Server) Close() error {
+	if s.adminCancel != nil {
+		s.adminCancel()
+	}
 	return s.httpServer.Close()
+}
+
+// UnlockSource clears a source address's cooldown and failure history so
+// operators can manually restore a blocked source. Returns whether the
+// source was tracked.
+func (s *Server) UnlockSource(source string) bool {
+	return s.authLimiter.UnlockSource(source)
+}
+
+// UnlockAccount clears an account's cooldown and failure history so
+// operators can manually restore a locked account. Returns whether the
+// account was tracked.
+func (s *Server) UnlockAccount(account string) bool {
+	return s.authLimiter.UnlockAccount(account)
+}
+
+// AuthLimitSnapshot returns a point-in-time copy of the lockout counters
+// and tracked entries for inspection.
+func (s *Server) AuthLimitSnapshot() authlimit.Snapshot {
+	return s.authLimiter.Snapshot()
 }
 
 // GetFingerprint is used to access the server fingerprint
@@ -201,19 +281,119 @@ func (s *Server) authUser(c ssh.ConnMetadata, password []byte) (*ssh.Permissions
 	if s.users.Len() == 0 {
 		return nil, nil
 	}
-	// check the user exists and has matching password
 	n := c.User()
+	source := authlimit.SourceKey(c.RemoteAddr())
+
+	// Evaluate existing cooldowns first. A locked source or account is
+	// rejected before any state changes, and the response text is
+	// independent of whether the username exists, so a locked source
+	// cannot probe account existence.
+	decision := s.authLimiter.Evaluate(source, n)
+	if decision.SourceLocked {
+		s.Infof("Login rejected: source %s is in cooldown (%s remaining)",
+			source, roundRemain(decision.SourceRemaining))
+		return nil, fmt.Errorf("authentication temporarily unavailable from this source, retry in %s",
+			roundRemain(decision.SourceRemaining))
+	}
+	if decision.AccountLocked {
+		s.Infof("Login rejected: account %q is in cooldown (%s remaining)",
+			n, roundRemain(decision.AccountRemaining))
+		return nil, fmt.Errorf("authentication temporarily unavailable for this account, retry in %s",
+			roundRemain(decision.AccountRemaining))
+	}
+
+	// check the user exists and has matching password. The comparison
+	// always runs (including for unknown users, against a nil slice) so
+	// the control-flow timing does not advertise account existence.
 	user, found := s.users.Get(n)
-	if !found || subtle.ConstantTimeCompare([]byte(user.Pass), password) != 1 {
-		//info level: operators should see failed attempts (#521)
-		s.Infof("Login failed for user %q (%s)", n, c.RemoteAddr())
+	passwordOK := found && subtle.ConstantTimeCompare([]byte(user.Pass), password) == 1
+	if !passwordOK {
+		// record on both dimensions; an internal state error fails closed
+		if _, _, _, _, err := s.authLimiter.RecordFailure(source, n); err != nil {
+			s.Infof("Login failed for user %q (%s); auth limiter internal error: %s", n, source, err)
+			return nil, fmt.Errorf("internal authentication failure, retry later")
+		}
+		//info level: operators should see failed attempts (#521).
+		//Never log the password, its length, or any derived material.
+		s.Infof("Login failed for user %q (%s)", n, source)
 		return nil, fmt.Errorf("invalid authentication for username: %s", n)
 	}
+
+	// correct password: clear this account's failure history; the source
+	// counter stays and decays with the window on its own
+	s.authLimiter.RecordSuccess(source, n)
 	// pass the username through to the handshake handler, which
 	// re-resolves the user (no session state to leak or race)
 	return &ssh.Permissions{
 		Extensions: map[string]string{"user": n},
 	}, nil
+}
+
+// roundRemain renders a cooldown remainder at second granularity so logs
+// and error messages stay stable across repeated calls.
+func roundRemain(d time.Duration) time.Duration {
+	if d < time.Second {
+		return time.Second
+	}
+	return d.Round(time.Second)
+}
+
+// validateAuthLimitInputs rejects explicitly-illegal (negative) values
+// before zero fields are replaced with defaults. A zero value means
+// "unset" and is filled with a safe default by authLimitConfig; a negative
+// value is an unambiguous operator error and must stop startup.
+func validateAuthLimitInputs(in AuthLimitConfig) error {
+	if in.SourceFailures < 0 {
+		return fmt.Errorf("auth-limit: source failure threshold must be >= 1, got %d", in.SourceFailures)
+	}
+	if in.AccountFailures < 0 {
+		return fmt.Errorf("auth-limit: account failure threshold must be >= 1, got %d", in.AccountFailures)
+	}
+	if in.Window < 0 {
+		return fmt.Errorf("auth-limit: window must be > 0, got %s", in.Window)
+	}
+	if in.Cooldown < 0 {
+		return fmt.Errorf("auth-limit: cooldown must be > 0, got %s", in.Cooldown)
+	}
+	if in.MaxSources < 0 {
+		return fmt.Errorf("auth-limit: max sources must be >= 1, got %d", in.MaxSources)
+	}
+	if in.MaxAccounts < 0 {
+		return fmt.Errorf("auth-limit: max accounts must be >= 1, got %d", in.MaxAccounts)
+	}
+	return nil
+}
+
+// authLimitConfig fills safe defaults for any unset limiter field.
+func authLimitConfig(in AuthLimitConfig) authlimit.Config {
+	def := authlimit.DefaultConfig()
+	out := authlimit.Config{
+		SourceFailures:  in.SourceFailures,
+		AccountFailures: in.AccountFailures,
+		Window:          in.Window,
+		Cooldown:        in.Cooldown,
+		MaxSources:      in.MaxSources,
+		MaxAccounts:     in.MaxAccounts,
+	}
+	if out.SourceFailures == 0 {
+		out.SourceFailures = def.SourceFailures
+	}
+	if out.AccountFailures == 0 {
+		out.AccountFailures = def.AccountFailures
+	}
+	if out.Window == 0 {
+		out.Window = def.Window
+	}
+	if out.Cooldown == 0 {
+		out.Cooldown = def.Cooldown
+	}
+	if out.MaxSources == 0 {
+		out.MaxSources = def.MaxSources
+	}
+	if out.MaxAccounts == 0 {
+		out.MaxAccounts = def.MaxAccounts
+	}
+	return out
 }
 
 // AddUser adds a new user into the server user index

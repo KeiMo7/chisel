@@ -417,6 +417,42 @@ Notes on authfile behavior:
 
 Internally, this is done using the _Password_ authentication method provided by SSH. Learn more about `crypto/ssh` here http://blog.gopheracademy.com/go-and-ssh/. Session opens/closes (with user, source address and remotes) and failed login attempts are logged at info level.
 
+#### Authentication failure lockout
+
+When authentication is enabled, the server tracks failed password attempts in memory along two **independent** dimensions, each with its own sliding window and cooldown:
+
+- **source** — the peer's IP address (the source port is ignored, so rotating ephemeral ports cannot reset the counter)
+- **account** — the presented username (locking one account never locks the others)
+
+When a dimension reaches its failure threshold within the counting window, it enters a cooldown. While a cooldown is active every attempt is rejected **before the SSH handshake completes**, including attempts carrying the correct password; the rejection and its remaining cooldown time are logged at info level. A successful login clears that account's failure history, while source history ages out naturally with the window. All state is in-memory: a restart starts with an empty store and nothing stays locked forever.
+
+Safe defaults apply automatically (10 failures per source or account within 5 minutes arms a 10-minute cooldown, at most 10 000 tracked entries per dimension). They can be tuned with flags or `CHISEL_` environment variables; illegal values are a fatal startup error:
+
+| Flag | Environment variable | Default |
+| --- | --- | --- |
+| `--auth-limit-source-failures` | `CHISEL_AUTH_LIMIT_SOURCE_FAILURES` | `10` |
+| `--auth-limit-account-failures` | `CHISEL_AUTH_LIMIT_ACCOUNT_FAILURES` | `10` |
+| `--auth-limit-window` | `CHISEL_AUTH_LIMIT_WINDOW` | `5m` |
+| `--auth-limit-cooldown` | `CHISEL_AUTH_LIMIT_COOLDOWN` | `10m` |
+| `--auth-limit-max-sources` | `CHISEL_AUTH_LIMIT_MAX_SOURCES` | `10000` |
+| `--auth-limit-max-accounts` | `CHISEL_AUTH_LIMIT_MAX_ACCOUNTS` | `10000` |
+| `--auth-admin` | `CHISEL_AUTH_ADMIN` | disabled |
+
+The state store is sharded, so concurrent failures from different sources do not contend on a global lock, and every increment is made under its shard's lock — concurrent failures cannot lose counts. When a dimension reaches its memory cap, expired entries are reclaimed first, then the oldest unlocked entry is evicted and an alert is logged naming the abandoned key; locked entries are never evicted, and if nothing can be evicted the server fails closed rather than silently stop tracking an attacker.
+
+Rejections from a cooldowned source use one identical response regardless of whether the username exists, so the lockout cannot be used to probe valid accounts. Failure logs never contain the password or its length.
+
+An optional local administration endpoint (`--auth-admin 127.0.0.1:PORT`, bind to localhost only) provides the operational entry points:
+
+```sh
+curl -s http://127.0.0.1:PORT/snapshot            # tracked sources/accounts and counters
+curl -s http://127.0.0.1:PORT/metrics             # monotonic observability counters
+curl -s -X POST 'http://127.0.0.1:PORT/unlock-source?source=203.0.113.5'
+curl -s -X POST 'http://127.0.0.1:PORT/unlock-account?account=alice'
+```
+
+The same actions are available in-process via `Server.UnlockSource`, `Server.UnlockAccount` and `Server.AuthLimitSnapshot`. When authentication is disabled (no `--auth`/`--authfile`) the limiter is fully inert and behaviour is unchanged.
+
 ### TLS Guide
 
 The simplest secure setup is `--tls-domain`, which provisions a LetsEncrypt certificate automatically (requires port 443 and a DNS record pointing at the server):

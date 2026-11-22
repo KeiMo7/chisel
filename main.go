@@ -204,6 +204,9 @@ func (o *serverOptions) Run() error {
 	if config.Auth == "" {
 		config.Auth = os.Getenv("AUTH")
 	}
+	if err := applyAuthLimitEnv(config); err != nil {
+		return err
+	}
 	s, err := chserver.NewServer(config)
 	if err != nil {
 		return err
@@ -220,6 +223,73 @@ func (o *serverOptions) Run() error {
 		return err
 	}
 	return s.Wait()
+}
+
+// applyAuthLimitEnv fills auth lockout settings from CHISEL_AUTH_LIMIT_*
+// environment variables when the corresponding flags were not given.
+// Malformed values are fatal: an illegal configuration must not silently
+// fall back to a default and start with weaker protection than intended.
+func applyAuthLimitEnv(config *chserver.Config) error {
+	al := &config.AuthLimit
+	var err error
+	if al.SourceFailures == 0 {
+		if al.SourceFailures, err = envPositiveInt("AUTH_LIMIT_SOURCE_FAILURES"); err != nil {
+			return err
+		}
+	}
+	if al.AccountFailures == 0 {
+		if al.AccountFailures, err = envPositiveInt("AUTH_LIMIT_ACCOUNT_FAILURES"); err != nil {
+			return err
+		}
+	}
+	if al.MaxSources == 0 {
+		if al.MaxSources, err = envPositiveInt("AUTH_LIMIT_MAX_SOURCES"); err != nil {
+			return err
+		}
+	}
+	if al.MaxAccounts == 0 {
+		if al.MaxAccounts, err = envPositiveInt("AUTH_LIMIT_MAX_ACCOUNTS"); err != nil {
+			return err
+		}
+	}
+	if al.Window == 0 {
+		if al.Window, err = envPositiveDuration("AUTH_LIMIT_WINDOW"); err != nil {
+			return err
+		}
+	}
+	if al.Cooldown == 0 {
+		if al.Cooldown, err = envPositiveDuration("AUTH_LIMIT_COOLDOWN"); err != nil {
+			return err
+		}
+	}
+	if al.AdminAddr == "" {
+		al.AdminAddr = settings.Env("AUTH_ADMIN")
+	}
+	return nil
+}
+
+func envPositiveInt(name string) (int, error) {
+	raw := settings.Env(name)
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive integer", "CHISEL_"+name, raw)
+	}
+	return n, nil
+}
+
+func envPositiveDuration(name string) (time.Duration, error) {
+	raw := settings.Env(name)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a duration > 0 (e.g. 5m)", "CHISEL_"+name, raw)
+	}
+	return d, nil
 }
 
 func setHeader(headers http.Header, arg string) error {
