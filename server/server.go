@@ -16,6 +16,7 @@ import (
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/requestlog"
 	"golang.org/x/crypto/ssh"
@@ -31,7 +32,9 @@ type Config struct {
 	Socks5    bool          `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
 	Reverse   bool          `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
 	KeepAlive time.Duration `opts:"name=keepalive,short=-" help:"An optional keepalive interval. Since the underlying transport is HTTP, in many instances we'll be traversing through proxies, often these proxies will close idle connections. You must specify a time with a unit, for example '5s' or '2m'. Defaults to '25s' (set to 0s to disable)."`
-	TLS       TLSConfig     `opts:"mode=embedded"`
+	// Quota contains opt-in mux admission, backpressure and fairness settings.
+	Quota quota.Config `opts:"mode=embedded"`
+	TLS   TLSConfig    `opts:"mode=embedded"`
 }
 
 // Server represent a chisel service
@@ -44,6 +47,7 @@ type Server struct {
 	sessCount    int32
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
+	quotaManager *quota.Manager
 }
 
 var upgrader = websocket.Upgrader{
@@ -61,6 +65,8 @@ func NewServer(c *Config) (*Server, error) {
 	}
 	server.Info = true
 	server.users = settings.NewUserIndex(server.Logger)
+	server.quotaManager = quota.NewManager(c.Quota)
+	c.Quota = server.quotaManager.Config
 	//pin the --auth user first so authfile reloads cannot drop it
 	if c.Auth != "" {
 		u := &settings.User{Addrs: []*regexp.Regexp{settings.UserAllowAll}}
@@ -194,6 +200,9 @@ func (s *Server) Close() error {
 func (s *Server) GetFingerprint() string {
 	return s.fingerprint
 }
+
+// Quota returns the process-wide admission and metrics registry.
+func (s *Server) Quota() *quota.Manager { return s.quotaManager }
 
 // authUser is responsible for validating the ssh user / password combination
 func (s *Server) authUser(c ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {

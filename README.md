@@ -499,6 +499,24 @@ See also the step-by-step [reverse tunneling example](example/reverse-tunneling-
 
 chisel works through CDNs that support WebSockets. For Cloudflare: enable WebSockets, proxy (orange-cloud) the DNS record, and connect clients with `https://`. The CDN terminates TLS, but the inner SSH layer means `--fingerprint` validation still authenticates your chisel server end-to-end — the CDN cannot read or modify tunneled traffic. Keep `--keepalive` at its `25s` default to stay under CDN idle timeouts, and note that proxies which strip `Upgrade` headers cannot carry chisel at all.
 
+### Multiplexed admission, backpressure and fairness
+
+The shared SSH/WebSocket transport is multiplexed. By default Chisel keeps its historical unlimited behavior. Operators can opt into bounded channel admission, per-channel backlog/backpressure, bounded datagram queues, chunk-level fair writes and slow-consumer reclamation with `--mux-protect` (or by setting any `--mux-*` limit).
+
+The main controls are:
+
+- `--mux-max-channels`: total channels in the local quota domain (process-wide on a server, one tunnel on a client).
+- `--mux-max-client-channels`: hard cap for one connected client/session.
+- `--mux-client-reserve`: protected slots that a client at/under its fair minimum can still use near global saturation.
+- `--mux-max-target-channels` and `--mux-target-reserve`: isolate one busy forwarding target from the client's other targets.
+- `--mux-max-backlog-bytes`: maximum queued plus in-flight bytes for one channel. Writers block at this bound, applying backpressure to the data source instead of growing memory.
+- `--mux-datagram-queue`: bounded datagram queue; congestion drops and counts datagrams rather than blocking the shared UDP receive loop.
+- `--mux-fair-chunk-bytes`: maximum bytes per scheduler turn.
+- `--mux-slow-consumer-timeout`: close only a channel whose bounded write remains blocked; zero uses the 15s default and a negative value disables the watchdog.
+- `--mux-metrics`: expose Prometheus text at `/metrics` and JSON at `/debug/quotas` on the server's HTTP listener.
+
+Rejections use stable SSH rejection reasons and safe machine messages: `quota: client limit`, `quota: global capacity`, and `quota: target limit`; ACL failures remain `administratively prohibited` / `access denied`. Metric labels contain only bounded `kind`, `direction`, `category` and `reason` values—never addresses, channel IDs, user names or credentials. Equivalent `CHISEL_MUX_*` environment variables are supported, including `CHISEL_MUX_MAX_CHANNELS`, `CHISEL_MUX_MAX_CLIENT_CHANNELS`, `CHISEL_MUX_CLIENT_RESERVE`, `CHISEL_MUX_MAX_TARGET_CHANNELS`, `CHISEL_MUX_MAX_BACKLOG_BYTES`, `CHISEL_MUX_DATAGRAM_QUEUE` and `CHISEL_MUX_SLOW_CONSUMER_TIMEOUT`.
+
 ### Tuning with environment variables
 
 Less common knobs are environment variables, all read with a `CHISEL_` prefix (e.g. `CHISEL_WS_TIMEOUT=10s`):

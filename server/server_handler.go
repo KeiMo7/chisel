@@ -1,6 +1,7 @@
 package chserver
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,6 +18,20 @@ import (
 
 // handleClientHandler is the main http websocket handler for the chisel server
 func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
+	if s.config.Quota.Metrics {
+		switch r.URL.Path {
+		case "/metrics":
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			_, _ = w.Write([]byte(s.quotaManager.Metrics.Prometheus()))
+			return
+		case "/debug/quotas":
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(s.quotaManager.Snapshot())
+			return
+		}
+	}
 	//websockets upgrade AND has chisel prefix
 	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
 	protocol := r.Header.Get("Sec-WebSocket-Protocol")
@@ -162,6 +177,9 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		Outbound:  true, //server always accepts outbound
 		Socks:     s.config.Socks5,
 		KeepAlive: s.config.KeepAlive,
+		Quota:     s.config.Quota,
+		Admission: s.quotaManager.Client(fmt.Sprintf("session-%d", id)),
+		Metrics:   s.quotaManager.Metrics,
 	}
 	//enforce ACL on every channel, not just the initial config.
 	//the user is re-resolved from the live index per channel, so

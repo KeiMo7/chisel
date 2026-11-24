@@ -7,12 +7,15 @@ import (
 	"sync"
 
 	"github.com/jpillora/chisel/share/cio"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/sizestr"
 	"golang.org/x/crypto/ssh"
 )
 
-// sshTunnel exposes a subset of Tunnel to subtypes
+// sshTunnel exposes a subset of Tunnel to subtypes. Test doubles may implement
+// only this minimal interface; quota-aware behaviour is discovered through
+// optional interfaces in admission.go.
 type sshTunnel interface {
 	getSSH(ctx context.Context) ssh.Conn
 }
@@ -165,19 +168,22 @@ func (p *Proxy) pipeRemote(ctx context.Context, src io.ReadWriteCloser) {
 
 	l := p.Fork("conn#%d", cid)
 	l.Debugf("Open")
-	sshConn := p.sshTun.getSSH(ctx)
-	if sshConn == nil {
-		l.Debugf("No remote connection")
-		return
+	kind := quota.KindForward
+	if p.remote.Reverse {
+		kind = quota.KindReverse
 	}
 	//ssh request for tcp connection for this proxy's remote
-	dst, reqs, err := sshConn.OpenChannel("chisel", []byte(p.remote.Remote()))
+	dst, reqs, lease, err := openSSHChannel(
+		p.sshTun, ctx, kind, p.remote.Remote(), []byte(p.remote.Remote()),
+	)
 	if err != nil {
 		l.Infof("Stream error: %s", err)
 		return
 	}
+	defer lease.Release()
 	go ssh.DiscardRequests(reqs)
-	//then pipe
-	s, r := cio.Pipe(src, dst)
+	//then pipe through the optional bounded/fair writer
+	stream := wrapSSHStream(p.sshTun, dst)
+	s, r := cio.Pipe(src, stream)
 	l.Debugf("Close (sent %s received %s)", sizestr.ToString(s), sizestr.ToString(r))
 }

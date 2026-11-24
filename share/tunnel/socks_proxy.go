@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jpillora/chisel/share/cio"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"golang.org/x/crypto/ssh"
 )
@@ -94,6 +95,13 @@ func socksPeerIP(ip net.IP, zone string) netip.Addr {
 	return a
 }
 
+func (s *socksProxy) metrics() *quota.Metrics {
+	if s == nil || s.proxy == nil || s.proxy.sshTun == nil {
+		return nil
+	}
+	return tunnelMetrics(s.proxy.sshTun)
+}
+
 func (s *socksProxy) readUDP() error {
 	// The extra byte detects oversize packets even when ReadFromUDP truncates.
 	buf := make([]byte, s.maxSize+1)
@@ -130,6 +138,7 @@ func (s *socksProxy) readUDP() error {
 			select {
 			case a.packets <- append([]byte(nil), buf[:n]...):
 			default: // a stalled association cannot block this shared listener
+				s.metrics().DropDatagram(quota.KindDatagram, "association_queue_full")
 			}
 		}
 		s.mu.Unlock()
@@ -228,15 +237,13 @@ func (s *socksProxy) handle(ctx context.Context, src *net.TCPConn) error {
 	if header[1] == 3 && s.udp == nil {
 		return socksReply(src, socksFailure, nil)
 	}
-	conn := s.proxy.sshTun.getSSH(ctx)
-	if conn == nil {
-		return socksReply(src, socksFailure, nil)
-	}
 	destination := "socks"
+	kind := quota.KindProxy
 	if header[1] == 3 {
 		destination = socksUDPDestination
+		kind = quota.KindDatagram
 	}
-	ch, reqs, err := conn.OpenChannel("chisel", []byte(destination))
+	ch, reqs, lease, err := openSSHChannel(s.proxy.sshTun, ctx, kind, destination, []byte(destination))
 	if err != nil {
 		code := byte(socksFailure)
 		var channelErr *ssh.OpenChannelError
@@ -253,6 +260,7 @@ func (s *socksProxy) handle(ctx context.Context, src *net.TCPConn) error {
 		socksReply(src, code, nil)
 		return err
 	}
+	defer lease.Release()
 	defer ch.Close()
 	go ssh.DiscardRequests(reqs)
 	stop := context.AfterFunc(ctx, func() { ch.Close() })
@@ -273,7 +281,7 @@ func (s *socksProxy) handle(ctx context.Context, src *net.TCPConn) error {
 			return err
 		}
 		src.SetDeadline(time.Time{})
-		cio.Pipe(src, ch)
+		cio.Pipe(src, wrapSSHStream(s.proxy.sshTun, ch))
 		return nil
 	}
 	// An old exit may accept the channel then fail its TCP dial. It must

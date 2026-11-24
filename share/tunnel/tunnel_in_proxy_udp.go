@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jpillora/chisel/share/cio"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/sizestr"
 	"golang.org/x/crypto/ssh"
@@ -79,6 +81,7 @@ type udpPeer struct {
 
 func (u *udpListener) run(ctx context.Context) error {
 	defer u.inbound.Close()
+	defer u.closeOutbound()
 	//udp doesn't accept connections,
 	//udp simply forwards packets
 	//and therefore only needs to listen
@@ -123,6 +126,11 @@ func (u *udpListener) runInbound(ctx context.Context) error {
 		//send over channel, including source address
 		b := buff[:n]
 		if err := uc.encode(addr.String(), b); err != nil {
+			if errors.Is(err, errDatagramDropped) {
+				//Congestion was counted by the bounded queue; never block or
+				//terminate this shared receive loop.
+				continue
+			}
 			if strings.HasSuffix(err.Error(), "EOF") {
 				continue //dropped packet...
 			}
@@ -246,28 +254,61 @@ func (u *udpListener) getUDPChan(ctx context.Context) (*udpChannel, error) {
 	//ssh request for udp packets for this proxy's remote,
 	//just "udp" since the remote address is sent with each packet
 	dstAddr := u.remote.Remote() + "/udp"
-	rwc, reqs, err := sshConn.OpenChannel("chisel", []byte(dstAddr))
+	rwc, reqs, lease, err := openSSHChannel(
+		u.sshTun, ctx, quota.KindDatagram, u.remote.Remote(), []byte(dstAddr),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("ssh-chan error: %s", err)
 	}
 	go ssh.DiscardRequests(reqs)
-	//remove on disconnect
-	go u.unsetUDPChan(sshConn)
 	//ready
 	o := &udpChannel{
-		r: gob.NewDecoder(rwc),
-		w: gob.NewEncoder(rwc),
-		c: rwc,
+		r:     gob.NewDecoder(rwc),
+		w:     gob.NewEncoder(rwc),
+		c:     rwc,
+		lease: lease,
 	}
+	if cfg := tunnelTrafficConfig(u.sshTun); cfg.Active() && cfg.DatagramQueue > 0 {
+		o.queue = quota.NewDropQueue[udpPacket](cfg.DatagramQueue, tunnelMetrics(u.sshTun), quota.KindDatagram)
+		go func() {
+			for {
+				select {
+				case <-o.queue.Done():
+					return
+				case p := <-o.queue.C():
+					if err := o.encodePacket(p); err != nil {
+						o.close()
+						return
+					}
+				}
+			}
+		}()
+	}
+	//remove on disconnect
+	go u.unsetUDPChan(sshConn, o)
 	u.outbound = o
 	u.Debugf("acquired channel")
 	return o, nil
 }
 
-func (u *udpListener) unsetUDPChan(sshConn ssh.Conn) {
-	sshConn.Wait()
-	u.Debugf("lost channel")
+func (u *udpListener) closeOutbound() {
 	u.outboundMut.Lock()
+	o := u.outbound
 	u.outbound = nil
 	u.outboundMut.Unlock()
+	if o != nil {
+		o.close()
+	}
+}
+
+func (u *udpListener) unsetUDPChan(sshConn ssh.Conn, old *udpChannel) {
+	_ = sshConn.Wait()
+	u.Debugf("lost channel")
+	u.outboundMut.Lock()
+	if u.outbound == old {
+		u.outbound = nil
+	}
+	u.outboundMut.Unlock()
+	//Always release this generation's lease. Lease.Release is once-only.
+	old.close()
 }

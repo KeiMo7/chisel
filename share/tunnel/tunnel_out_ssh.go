@@ -10,6 +10,7 @@ import (
 
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
+	"github.com/jpillora/chisel/share/quota"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/sizestr"
 	"golang.org/x/crypto/ssh"
@@ -62,6 +63,25 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 		ch.Reject(ssh.Prohibited, "access denied")
 		return
 	}
+	// The unique incoming-channel quota checkpoint. ACL has already had the
+	// first refusal, preserving the historical order and rejection code.
+	kind := quota.KindForward
+	switch {
+	case t.Config.AcceptAs != "":
+		kind = t.Config.AcceptAs
+	case socksUDP || udp:
+		kind = quota.KindDatagram
+	case socks:
+		kind = quota.KindProxy
+	}
+	lease, qerr := t.Config.Admission.Admit(ctx, kind, quota.DirectionIn, hostPort)
+	if qerr != nil {
+		reason, message := quotaRejectMessage(qerr)
+		t.Debugf("Admission rejected: %s", qerr)
+		ch.Reject(reason, message)
+		return
+	}
+	defer lease.Release()
 	//tcp: dial the target before accepting the channel, so dial
 	//failures propagate to the inbound side instead of presenting
 	//a successful connection to a dead target
@@ -84,7 +104,7 @@ func (t *Tunnel) handleSSHChannel(ctx context.Context, ch ssh.NewChannel) {
 		}
 		return
 	}
-	stream := io.ReadWriteCloser(sshChan)
+	stream := t.wrapStream(sshChan)
 	defer stream.Close()
 	go ssh.DiscardRequests(reqs)
 	l := t.Logger.Fork("conn#%d", t.connStats.New())
